@@ -1,0 +1,927 @@
+#!/usr/bin/perl
+#
+# Copyright International Business Machines Corp, 2018.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+#=============================================================================
+# File        : srun
+# Description : srun wrapper used in lsf cluster
+#             : LSB_JOB_OUTPUT_LOGGING=N should be configured ...
+#
+# Author      : Guang Yuan Wu (wugyuan@cn.ibm.com)
+#
+#=============================================================================
+# Declaration of required modules and/or Perl libraries
+#=============================================================================
+
+use Getopt::Std;
+use File::Basename qw<basename dirname>;
+
+use Getopt::Long;
+use Getopt::Long qw(GetOptionsFromArray);
+Getopt::Long::Configure("bundling", "no_ignore_case", "pass_through");
+
+use IO::File;
+use POSIX qw(tmpnam);
+
+use IO::Handle;
+STDOUT->autoflush(1);
+STDERR->autoflush(1);
+
+my ($debug) = 0; # 0: on/off debug depends on env SLURM_TO_LSF_DEBUG and SLURM_TO_LSF_DEBUG_SRUN
+my $pname = basename $0;
+
+# in batch mode, from environment of sbatch
+my $g_sbatch_ntasks = 0;
+my $g_sbatch_ntasks_per_node = 0;
+my $g_sbatch_nodes = 0;
+
+my $srun_batch_mode = 0; # if triggered by sbatch ... the mode is 1
+
+my $g_cli_lsf = "bsub -I";
+my $g_executable_args = "";
+my $g_executable = "";
+
+# supported options
+my $g_help_option_slurm = 0;
+my $g_usage_option_slurm = 0;
+
+my $g_error_option_slurm = ""; # -e, --error=err
+my $g_out_option_slurm = ""; # -o, --output=out
+my $g_open_mode_option_slurm = ""; # default is truncated
+my $g_out_option_lsf = "-oo";
+my $g_error_option_lsf = "-eo";
+
+my $g_begin_option_slurm = "";
+my $g_dependency_option_slurm = "";
+my $g_export_option_slurm = "";
+my $g_exclusive_option_slurm = "";
+my $g_hold_option_slurm = 0;
+my $g_input_option_slurm = "";
+my $g_jname_option_slurm = "";
+my $g_mailuser_option_slurm = "";
+my $g_partition_option_slurm = "";
+my $g_time_option_slurm = "";
+my $g_nodelist_option_slurm = "";
+
+my $g_ntasks_option_slurm = "";
+my $g_ntasks_per_node_option_slurm = "";
+my $g_nodes_option_slurm = "";
+
+my $g_affinisty_string_lsf = "";
+
+my $g_distribution_slurm = "";
+my $g_sockets_per_node_slurm = "";
+my $g_cores_per_socket_slurm = "";
+my $g_threads_per_core_slurm = "";
+my $g_ntasks_per_core_slurm = "";
+my $g_ntasks_per_socket_slurm = "";
+my $g_cpu_bind_slurm = "";
+my $g_mem_bind_slurm = "";
+
+my $g_total_numa_nodes_limt = "";
+my $g_total_processors_limt = "";
+my $g_total_cores_limt = "";
+my $g_total_threads_limt = "";
+
+my $g_cli_error_tmp_file = ""; # save error output from lsf command
+
+#=============================================================================
+# sub routine: open_debug_file 
+# Input arguements: nothing
+# Return value: nothing
+#=============================================================================
+sub open_debug_file {
+    if ($debug == 0) {
+        if (($ENV{"SLURM_TO_LSF_DEBUG"} ne "") || ($ENV{"SLURM_TO_LSF_DEBUG_SRUN"} ne "")) {
+            $debug = 1;
+        }
+    }
+
+    if ($debug) { # debug messages dumps to /tmp/srun.uid.pid
+        open DBGFILE, ">/tmp/$pname.$ENV{'USER'}.$$" or die "can't open /tmp/$pname.$ENV{'USER'}.$$ file to write\n";
+
+        print DBGFILE "execution time : ";
+        print DBGFILE scalar localtime;
+        print DBGFILE "\n";
+        print DBGFILE "pid  : ".$$."\n";
+        print DBGFILE "ruid : ".$<."\n";
+        print DBGFILE "euid : ".$>."\n";
+        #print DBGFILE "rgid : ".$(."\n";
+        #print DBGFILE "egid : ".$)."\n";
+        print DBGFILE "user : ".$ENV{'USER'}."\n";
+        print DBGFILE "pwd  : ".$ENV{'PWD'}."\n";
+        print DBGFILE "home : ".$ENV{'HOME'}."\n";
+        print DBGFILE "host : ".$ENV{'HOST'}."\n";
+        print DBGFILE "hostn: ".$ENV{'HOSTNAME'}."\n";
+
+        print DBGFILE "LSF_BINDIR: ".$ENV{'LSF_BINDIR'}."\n";
+        print DBGFILE "BATCH_SLURM_LSF: ".$ENV{'BATCH_SLURM_LSF'}."\n";
+        print DBGFILE "SLURM_NNODES: ".$ENV{'SLURM_NNODES'}."\n";
+        print DBGFILE "SLURM_NTASKS: ".$ENV{'SLURM_NTASKS'}."\n";
+        print DBGFILE "SLURM_NTASKS_PER_NODE: ".$ENV{'SLURM_NTASKS_PER_NODE'}."\n";
+        print DBGFILE "LSB_MCPU_HOSTS: ".$ENV{'LSB_MCPU_HOSTS'}."\n";
+        print DBGFILE "LSB_HOSTS: ".$ENV{'LSB_HOSTS'}."\n";
+
+        print DBGFILE "argv: @ARGV\n";
+
+    }
+}
+
+#=============================================================================
+# sub routine: close_debug_file 
+# Input arguements: nothing
+# Return value: nothing
+#=============================================================================
+sub close_debug_file {
+    if ($debug) {
+        close(DBGFILE);
+    }
+}
+
+#=============================================================================
+# sub routine: signal_handler 
+# Input arguements: nothing
+# Return value: nothing
+#=============================================================================
+sub signal_handler {
+    exit(1);
+}
+
+#=============================================================================
+# sub routine: showShortUsage
+# Input arguements: nothing
+# Return value: nothing
+#=============================================================================
+sub showShortUsage {
+    print STDOUT << "EndOfUsage";
+Usage: $pname [-N nnodes] [-n ntasks] [-i in] [-o out] [-e err] [-p partition] 
+            [--hold] [-t minutes] [-J jobname] [--open-mode=a|A|t|T] [-m dist] 
+            [--cpu_bind=...] [--mem_bind=...] [--ntasks-per-socket=n]
+            [--ntasks-per-core=n] [--sockets-per-node=S] [--cores-per-socket=C]
+            [--threads-per-core=T] [--ntasks-per-node=n] [--mail-user=user] 
+            executable [args...]
+EndOfUsage
+
+}
+
+#=============================================================================
+# sub routine: showUsage
+# Input arguements: nothing
+# Return value: nothing
+#=============================================================================
+sub showUsage {
+    print STDOUT << "EndOfUsage";
+Usage: $pname [OPTIONS...] executable [args...]
+
+Parallel run options:
+      --export=env_vars|NONE  environment variables passed to launcher with
+                              optional values or NONE (pass no variables)
+  -e, --error=err             location of stderr redirection
+  -H, --hold                  submit job in held state
+  -i, --input=in              location of stdin redirection
+  -J, --job-name=jobname      name of job
+  -m, --distribution=type     distribution method for processes to nodes
+                              (type = block|cyclic)
+      --mail-user=user        who to send email notification for job state
+                              changes
+  -n, --ntasks=ntasks         number of tasks to run
+      --ntasks-per-node=n     number of tasks to invoke on each node
+  -N, --nodes=N               number of nodes on which to run (N = min[-max])
+  -o, --output=out            location of stdout redirection
+  -o, --output=out            location of stdout redirection
+      --open-mode=<append|truncate> open the output and error files using 
+                              append or truncate mode as specified
+  -p, --partition=partition   partition requested
+  -t, --time=minutes          time limit
+
+Consumable resources related options:
+      --exclusive[=user]      allocate nodes in exclusive mode when
+                              cpu consumable resource is enabled
+                              or don't share CPUs for job steps
+
+Affinity/Multi-core options: (when the task/affinity plugin is enabled)
+      --sockets-per-node=S    number of sockets per node to allocate
+      --cores-per-socket=C    number of cores per socket to allocate
+      --threads-per-core=T    number of threads per core to allocate
+                              total cpus requested = (N x S x C x T)
+
+      --ntasks-per-core=n     number of tasks to invoke on each core
+      --ntasks-per-socket=n   number of tasks to invoke on each socket
+      --cpu_bind=             Bind tasks to CPUs
+      --mem_bind=             Bind memory to locality domains (ldom)
+
+Help options:
+  -h, --help                  show this help message
+      --usage                 display brief usage message
+
+EndOfUsage
+
+}
+
+
+#====================================================================================
+# sub routine: parseOptions
+# Input arguements: nothing
+# Return value:  nothing
+#====================================================================================
+sub parseOptions
+{
+    local @myopts = ();
+
+    local @slurm_cmd_options = ();
+    local @executable_args = ();
+    local $ingore_value;
+
+    @myopts = @ARGV;
+    local $ret = GetOptionsFromArray(\@myopts, 
+            'help|h' => \$ingore_value,
+            'usage' => \$ingore_value,
+            'error|e=s' => \$ingore_value,
+            'out|o=s' => \$ingore_value,
+            'open-mode=s' => \$ingore_value,
+            'export=s' => \$ingore_value,
+            'exclusive=s' => \$ingore_value,
+            'hold|H' => \$ingore_value,
+            'input|i=s' => \$ingore_value,
+            'job-name|J=s' => \$ingore_value,
+            'mail-user=s' => \$ingore_value,
+            'partition|p=s' => \$ingore_value,
+            'time|t=s' => \$ingore_value,
+            #'nodelist|w=s' => \$ingore_value,
+            'ntasks|n=s' => \$ingore_value,
+            'ntasks-per-node=s' => \$ingore_value,
+
+            'nodes|N=s' => \$ingore_value,
+            'distribution|m=s' => \$ingore_value,
+            'sockets-per-node=s' => \$ingore_value,
+            'cores-per-socket=s' => \$ingore_value,
+            'threads-per-core=s' => \$ingore_value,
+            'ntasks-per-core=s' => \$ingore_value,
+            'ntasks-per-socket=s' => \$ingore_value,
+            'cpu_bind=s' => \$ingore_value,
+            'mem_bind=s' => \$ingore_value,
+
+            '<>' => sub { push (@executable_args, @_) }
+            );
+    print DBGFILE __LINE__." ret: $ret\n";
+
+    print DBGFILE "executable_args: @executable_args\n";
+    if ($executable_args[0] =~ /^ *-/) { # executable shoulde not start with '-' char
+        print STDERR "$pname: invalid option -- '$executable_args[0]', or not supported by the wrapper\n";
+        print STDERR "Try \"$pname --help\" for more information\n";
+        exit (1);
+    }
+
+    $g_executable = $executable_args[0];
+
+    local $i = 0;
+    local $key = "";
+    foreach $key (@ARGV) {
+        if ($key eq $executable_args[0]) {
+            for ($i; $i <= $#ARGV; $i++) {
+                $g_executable_args .= $ARGV[$i]." ";
+            }
+            last;
+        } else {
+            $slurm_cmd_options[$i] = $key;
+            $i++;
+        }
+    }
+    $g_executable_args =~ s/ $//; # remove last ' ', otherwise blaunch will failed
+    print DBGFILE "g_executable_args: $g_executable_args\n";
+
+    print DBGFILE "slurm_cmd_options: @slurm_cmd_options\n";
+    $ret = GetOptionsFromArray(\@slurm_cmd_options, 
+            'help|h' => \$g_help_option_slurm,
+            'usage' => \$g_usage_option_slurm,
+            'error|e=s' => \$g_error_option_slurm,
+            'out|o=s' => \$g_out_option_slurm,
+            'open-mode=s' => \$g_open_mode_option_slurm,
+            'export=s' => \$g_export_option_slurm,
+            'exclusive=s' => \$g_exclusive_option_slurm,
+            'hold|H' => \$g_hold_option_slurm,
+            'input|i=s' => \$g_input_option_slurm,
+            'job-name|J=s' => \$g_jname_option_slurm,
+            'mail-user=s' => \$g_mailuser_option_slurm,
+            'partition|p=s' => \$g_partition_option_slurm,
+            'time|t=s' => \$g_time_option_slurm,
+            #'nodelist|w=s' => \$g_nodelist_option_slurm,
+            'ntasks|n=s' => \$g_ntasks_option_slurm,
+            'ntasks-per-node=s' => \$g_ntasks_per_node_option_slurm,
+            'nodes|N=s' => \$g_nodes_option_slurm,
+            'distribution|m=s' => \$g_distribution_slurm,
+            'sockets-per-node=s' => \$g_sockets_per_node_slurm,
+            'cores-per-socket=s' => \$g_cores_per_socket_slurm,
+            'threads-per-core=s' => \$g_threads_per_core_slurm,
+            'ntasks-per-core=s' => \$g_ntasks_per_core_slurm,
+            'ntasks-per-socket=s' => \$g_ntasks_per_socket_slurm,
+            'cpu_bind=s' => \$g_cpu_bind_slurm,
+            'mem_bind=s' => \$g_mem_bind_slurm,
+            );
+    print DBGFILE __LINE__." ret: $ret\n";
+
+#    GetOptions( 
+#            'help|h' => \$g_help_option_slurm,
+#            'usage' => \$g_usage_option_slurm,
+#            'out|o=s' => \$g_out_option_slurm,
+#            'open-mode=s' => \$g_open_mode_option_slurm,
+#            '<>' => sub { push (@g_executable_args, @_) }
+#            ); 
+
+}
+
+#=============================================================================
+# sub routine: execute_lim_t
+# Input arguements: nothing
+# Return value: nothing
+#=============================================================================
+sub execute_lim_t {
+    if ($g_total_numa_nodes_limt eq "") {
+        local $limt_output = `lim -t`;
+        local @seg_limt_output = split(/\n/, $limt_output);
+        local $tmp;
+        ($tmp, $g_total_numa_nodes_limt) = split(/:/, $seg_limt_output[2]);
+        $g_total_numa_nodes_limt =~ s/^\s+|\s+$//g;
+        ($tmp, $g_total_processors_limt) = split(/:/, $seg_limt_output[3]);
+        $g_total_processors_limt =~ s/^\s+|\s+$//g;
+        ($tmp, $g_total_cores_limt) = split(/:/, $seg_limt_output[4]);
+        $g_total_cores_limt =~ s/^\s+|\s+$//g;
+        ($tmp, $g_total_threads_limt) = split(/:/, $seg_limt_output[5]);
+        $g_total_threads_limt =~ s/^\s+|\s+$//g;
+
+        print DBGFILE "g_total_numa_nodes_limt: $g_total_numa_nodes_limt, g_total_processors_limt: $g_total_processors_limt, g_total_cores_limt: $g_total_cores_limt, g_total_threads_limt: $g_total_threads_limt\n";
+    }
+}
+
+#=============================================================================
+# sub routine: generate_mlist 
+# Input arguements: nothing
+# Return value: machine list of -z in blaunch
+#=============================================================================
+sub generate_mlist {
+    local $mcpu_hosts = $ENV{'LSB_MCPU_HOSTS'}; # "host1 cnt1 host2 cnt2 host3 cnt3 ..."
+    local @seg_mcpu_hosts = split(/ /, $mcpu_hosts);
+    local $mlist = "";
+    local $mcnt = 0;
+    local $idx = 0;
+    for ($i = 0; $i <= $#seg_mcpu_hosts; $i++) { # TODO: maybe need several times loop until $mcnt > $g_ntasks_option_slurm
+        if ($seg_mcpu_hosts[$i+1] >= $g_ntasks_per_node_option_slurm) {
+            for ($j = 0; $j < $g_ntasks_per_node_option_slurm; $j++) {
+                $mlist .= " $seg_mcpu_hosts[$i]";
+                $mcnt++;
+                if ($mcnt >= $g_ntasks_option_slurm) {
+                    last;
+                }
+            }
+        } else {
+            for ($j = 0; $j < $seg_mcpu_hosts[$i+1]; $j++) {
+                $mlist .= " $seg_mcpu_hosts[$i]";
+                $mcnt++;
+                if ($mcnt >= $g_ntasks_option_slurm) {
+                    last;
+                }
+            }
+        }
+
+        if ($mcnt >= $g_ntasks_option_slurm) {
+            last;
+        }
+        $i++;
+    }
+
+    return $mlist;
+}
+
+
+#******************************************************************************
+# main
+#******************************************************************************
+
+if (scalar(@ARGV) < 1) {
+    print STDERR "$pname: fatal: No command given to execute.\n";
+    exit (1);
+}
+
+if ($ENV{'LSF_BINDIR'} eq "") {
+    print STDERR "$pname: please source LSF configure profile.\n";
+    exit(1);
+}
+
+open_debug_file();
+
+if ($ENV{'BATCH_SLURM_LSF'} ne "") {
+    $srun_batch_mode = 1;
+}
+
+parseOptions();
+
+if (1 == $g_help_option_slurm) {
+    showUsage();
+    exit (0);
+}
+
+if (1 == $g_usage_option_slurm) {
+    showShortUsage();
+    exit (0);
+}
+
+if ($g_open_mode_option_slurm ne "") {
+    print DBGFILE "g_open_mode_option_slurm: $g_open_mode_option_slurm\n";
+    if (lc($g_open_mode_option_slurm) eq "a") {
+        $g_out_option_lsf = "-o";
+        $g_error_option_lsf = "-e";
+    }
+}
+
+if ($g_out_option_slurm ne "") {
+    print DBGFILE "g_out_option_slurm: $g_out_option_slurm\n";
+    if ($g_out_option_slurm eq "none") {
+        $g_cli_lsf .= " $g_out_option_lsf /dev/null";
+    } else {
+        $g_cli_lsf .= " $g_out_option_lsf $g_out_option_slurm";
+    }
+}
+
+if ($g_error_option_slurm ne "") {
+    print DBGFILE "g_error_option_slurm: $g_error_option_slurm\n";
+    if ($g_error_option_slurm eq "none") {
+        $g_cli_lsf .= " $g_error_option_lsf /dev/null";
+    } else {
+        $g_cli_lsf .= " $g_error_option_lsf $g_error_option_slurm";
+    }
+}
+
+if ($g_export_option_slurm ne "") {
+    print DBGFILE "g_export_option_slurm: $g_export_option_slurm\n";
+    if (lc($g_export_option_slurm) eq "none") {
+        $g_cli_lsf .= " -env \"".lc($g_export_option_slurm)."\"";
+    } else {
+        $g_export_option_slurm =~ s/none,//; # remove none,
+        $g_cli_lsf .= " -env \"".$g_export_option_slurm."\"";
+    }
+
+}
+
+if ($g_exclusive_option_slurm ne "") {
+    print DBGFILE "g_exclusive_option_slurm: $g_exclusive_option_slurm\n";
+    if (lc($g_exclusive_option_slurm) eq "user") {
+        $g_cli_lsf .= " -x";
+    } elsif (lc($g_exclusive_option_slurm) eq "mcs") {
+        print STDERR "$pname: error: unsupported exclusive option $g_exclusive_option_slurm\n";
+        exit (1);
+    } else {
+        print STDERR "$pname: error: invalid exclusive option $g_exclusive_option_slurm\n";
+        exit (1);
+    }
+}
+
+if (1 == $g_hold_option_slurm) {
+    $g_cli_lsf .= " -H";
+}
+
+if ($g_input_option_slurm ne "") {
+    print DBGFILE "g_input_option_slurm: $g_input_option_slurm\n";
+    $g_cli_lsf .= " -i ".$g_input_option_slurm;
+}
+
+if ($g_jname_option_slurm ne "") {
+    print DBGFILE "g_jname_option_slurm: $g_jname_option_slurm\n";
+    $g_cli_lsf .= " -J ".$g_jname_option_slurm;
+} else {
+    print DBGFILE "set job name to $g_executable\n";
+    $g_cli_lsf .= " -J ".$g_executable; # in slurm, the job name is the executable name by default (in lsf, it is "executable args")
+}
+
+if ($g_mailuser_option_slurm ne "") {
+    print DBGFILE "g_mailuser_option_slurm: $g_mailuser_option_slurm\n";
+    $g_cli_lsf .= " -u ".$g_mailuser_option_slurm;
+}
+
+if ($g_partition_option_slurm ne "") {
+    print DBGFILE "g_partition_option_slurm: $g_partition_option_slurm\n";
+    $g_cli_lsf .= " -q ".$g_partition_option_slurm;
+}
+
+if ($g_time_option_slurm ne "") {
+    print DBGFILE "g_time_option_slurm: $g_time_option_slurm\n";
+    if ($g_time_option_slurm =~ /^?\d+$/) {
+        $g_cli_lsf .= " -W ".$g_time_option_slurm;
+    } else {
+        print STDERR "$pname: error: Invalid time limit specification\n";
+        exit (1);
+    }
+}
+
+if ($g_nodelist_option_slurm ne "") { # TODO
+    print DBGFILE "g_nodelist_option_slurm: $g_nodelist_option_slurm\n";
+    $g_cli_lsf .= " -m ".$g_nodelist_option_slurm;
+}
+
+
+local $ntasks_configured = 0;
+local $ntasks_per_node_configured = 0;
+
+if ($srun_batch_mode == 1) {
+    if ($g_nodes_option_slurm ne "") { 
+        print DBGFILE "g_nodes_option_slurm: $g_nodes_option_slurm\n";
+=pod
+    rules:
+    1. -N a --ntasks-per-node b ==> bsub -n (a*b) span[ptile=b]
+    2. -N a -n b --ntask-per-node c ==> bsub -n b span[ptile=^(b/a)]
+    3. -N a -n b ==> bsub -n b span[ptile=^(b/a)]
+    4. -N a ==> bsub -n a span[ptile=1]
+=cut
+
+        if (($g_ntasks_per_node_option_slurm eq "") and ($g_ntasks_option_slurm eq "")) { # 4
+            $g_ntasks_per_node_option_slurm = 1;
+            $g_ntasks_option_slurm = $g_nodes_option_slurm;
+        } elsif ($g_ntasks_option_slurm eq "") { # 1
+            $g_ntasks_option_slurm = $g_nodes_option_slurm * $g_ntasks_per_node_option_slurm;
+        } else { # 2 & 3
+            local $tmp_cnt = $g_ntasks_option_slurm / $g_nodes_option_slurm;
+            $g_ntasks_per_node_option_slurm = int($tmp_cnt) == $tmp_cnt ? $tmp_cnt : int($tmp_cnt) + 1;
+        }
+
+        $g_sbatch_ntasks = $ENV{'SLURM_NTASKS'};
+        $g_sbatch_ntasks_per_node = $ENV{'SLURM_NTASKS_PER_NODE'};
+        $ntasks_configured = 1;
+        $ntasks_per_node_configured = 1;
+        print DBGFILE __LINE__." g_ntasks_option_slurm: $g_ntasks_option_slurm, g_ntasks_per_node_option_slurm: $g_ntasks_per_node_option_slurm\n";
+    } else {
+        $g_sbatch_ntasks = $ENV{'SLURM_NTASKS'};
+        if ($g_ntasks_option_slurm eq "") {
+            $g_ntasks_option_slurm = $g_sbatch_ntasks;
+        } else {
+            $ntasks_configured = 1;
+        }
+
+        $g_sbatch_ntasks_per_node = $ENV{'SLURM_NTASKS_PER_NODE'};
+        if ($g_ntasks_per_node_option_slurm eq "") {
+            $g_ntasks_per_node_option_slurm = $g_sbatch_ntasks_per_node;
+        } else {
+            $ntasks_per_node_configured = 1;
+        }
+        print DBGFILE __LINE__." g_ntasks_option_slurm: $g_ntasks_option_slurm, g_ntasks_per_node_option_slurm: $g_ntasks_per_node_option_slurm\n";
+    }
+} else {
+    if ($g_nodes_option_slurm ne "") { 
+        print DBGFILE "g_nodes_option_slurm: $g_nodes_option_slurm\n";
+        $g_nodes_option_slurm =~ s/(.*)-.*/$1/;
+=pod
+    rules:
+    1. -N a --ntasks-per-node b ==> bsub -n (a*b) span[ptile=b]
+    2. -N a -n b --ntask-per-node c ==> bsub -n b span[ptile=^(b/a)]
+    3. -N a -n b ==> bsub -n b span[ptile=^(b/a)]
+    4. -N a ==> bsub -n a span[ptile=1]
+=cut
+        if (($g_ntasks_per_node_option_slurm eq "") and ($g_ntasks_option_slurm eq "")) { # 4
+            $g_ntasks_per_node_option_slurm = 1;
+            $g_ntasks_option_slurm = $g_nodes_option_slurm;
+        } elsif ($g_ntasks_option_slurm eq "") { # 1
+            $g_ntasks_option_slurm = $g_nodes_option_slurm * $g_ntasks_per_node_option_slurm;
+        } else { # 2 & 3
+            local $tmp_cnt = $g_ntasks_option_slurm / $g_nodes_option_slurm;
+            $g_ntasks_per_node_option_slurm = int($tmp_cnt) == $tmp_cnt ? $tmp_cnt : int($tmp_cnt) + 1;
+        }
+        print DBGFILE __LINE__." g_ntasks_option_slurm: $g_ntasks_option_slurm, g_ntasks_per_node_option_slurm: $g_ntasks_per_node_option_slurm\n";
+    } else {
+        local $is_ntasks_per_node_configured = 0;
+        # extract host mxj value
+        $hname = `hostname`;
+        chomp($hname);
+        print DBGFILE "g_host_mxj($hname): ";
+        local $g_host_mxj = `bhosts $hname | grep $hname | awk '{print \$4;}'`;
+        chomp($g_host_mxj);
+        print DBGFILE "$g_host_mxj\n";
+
+        if (($g_ntasks_option_slurm ne "") and ($g_ntasks_per_node_option_slurm ne "")) {
+            $is_ntasks_per_node_configured = 1;
+        } elsif ($g_ntasks_option_slurm ne "") {
+            $g_ntasks_per_node_option_slurm = $g_host_mxj;
+        } elsif ($g_ntasks_per_node_option_slurm ne "") {
+            $is_ntasks_per_node_configured = 1;
+            $g_ntasks_option_slurm = $g_ntasks_per_node_option_slurm;
+        } else {
+            $g_ntasks_option_slurm = 1;
+            $g_ntasks_per_node_option_slurm = 1;
+        }
+
+        print DBGFILE __LINE__." g_ntasks_option_slurm: $g_ntasks_option_slurm, g_ntasks_per_node_option_slurm: $g_ntasks_per_node_option_slurm\n";
+
+        if ($g_ntasks_per_node_option_slurm > $g_host_mxj) {
+            print STDERR "$pname: error: CPU count per node can not be satisfied\n";
+            print STDERR "$pname: error: Unable to allocate resources: Requested node configuration is not available\n";
+            exit(1);
+        }
+
+        if ($g_ntasks_per_node_option_slurm > $g_ntasks_option_slurm) {
+            $g_ntasks_per_node_option_slurm = $g_ntasks_option_slurm;
+        }
+
+        # adjust $g_ntasks_per_node_option_slurm according slurm behavior
+        # -n5,--ntasks-per-node=4, in slurm, 3 tasks on first node, 2 tasks on second node
+        # in lsf, the command should be blaunch -n 5 ... ptile=3 (below code is alogrithm to convert 4 to 3
+        local $tmp_cnt = $g_ntasks_option_slurm / $g_ntasks_per_node_option_slurm;
+        local $min_node = int($tmp_cnt) == $tmp_cnt ? $tmp_cnt : int($tmp_cnt) + 1;
+        if ($is_ntasks_per_node_configured == 1) { # not need adjust if not configure --ntasks-per-node in cli
+            if ($min_node * $g_ntasks_per_node_option_slurm != $g_ntasks_option_slurm) {
+                $tmp_cnt = $g_ntasks_option_slurm / $min_node;
+                $g_ntasks_per_node_option_slurm = int($tmp_cnt) == $tmp_cnt ? $tmp_cnt : int($tmp_cnt) + 1;
+                print DBGFILE "adjusted g_ntasks_per_node_option_slurm: $g_ntasks_per_node_option_slurm\n";
+            }
+        }
+        print DBGFILE __LINE__." g_ntasks_option_slurm: $g_ntasks_option_slurm, g_ntasks_per_node_option_slurm: $g_ntasks_per_node_option_slurm\n";
+    }
+
+    # support affinity options
+    if ($g_distribution_slurm ne "") { # only support block, for cyclic, can depend blaunch -z "host1 host2 host1 host2 ..." ?
+        print DBGFILE "g_distribution_slurm: $g_distribution_slurm\n";
+    }
+
+    if ($g_sockets_per_node_slurm ne "") {
+        print DBGFILE "g_sockets_per_node_slurm: $g_sockets_per_node_slurm\n";
+        execute_lim_t();
+
+        if ($g_sockets_per_node_slurm > $g_total_processors_limt) {
+            print DBGFILE __LINE__." $pname: error: Socket, core and/or thread specification can not be satisfied\n";
+            print DBGFILE __LINE__." $pname: error: Unable to allocate resources: Requested node configuration is not available\n";
+            print STDERR "$pname: error: Socket, core and/or thread specification can not be satisfied\n";
+            print STDERR "$pname: error: Unable to allocate resources: Requested node configuration is not available\n";
+            exit(1);
+        }
+    }
+
+    if ($g_cores_per_socket_slurm ne "") {
+        print DBGFILE "g_cores_per_socket_slurm: $g_cores_per_socket_slurm\n";
+        execute_lim_t();
+
+        if ($g_cores_per_socket_slurm > $g_total_cores_limt / $g_total_processors_limt) {
+            print DBGFILE __LINE__." $pname: error: Socket, core and/or thread specification can not be satisfied\n";
+            print DBGFILE __LINE__." $pname: error: Unable to allocate resources: Requested node configuration is not available\n";
+            print STDERR "$pname: error: Socket, core and/or thread specification can not be satisfied\n";
+            print STDERR "$pname: error: Unable to allocate resources: Requested node configuration is not available\n";
+            exit(1);
+        }
+    }
+
+    if ($g_threads_per_core_slurm ne "") {
+        print DBGFILE "g_threads_per_core_slurm: $g_threads_per_core_slurm\n";
+        execute_lim_t();
+
+        if ($g_threads_per_core_slurm > $g_total_threads_limt / $g_total_cores_limt) {
+            print DBGFILE __LINE__." $pname: error: Socket, core and/or thread specification can not be satisfied\n";
+            print DBGFILE __LINE__." $pname: error: Unable to allocate resources: Requested node configuration is not available\n";
+            print STDERR "$pname: error: Socket, core and/or thread specification can not be satisfied\n";
+            print STDERR "$pname: error: Unable to allocate resources: Requested node configuration is not available\n";
+            exit(1);
+        }
+    }
+
+    local $SelectTypeParameters = $ENV{"SelectTypeParameters"};
+    print DBGFILE "SelectTypeParameters: $SelectTypeParameters\n";
+    if ($SelectTypeParameters eq "") { # default affinity: SelectType=select/linear
+        if ($g_cpu_bind_slurm ne "") {
+            execute_lim_t();
+            print DBGFILE "g_cpu_bind_slurm: $g_cpu_bind_slurm\n";
+            if ("thread" eq substr($g_cpu_bind_slurm, 0, length("thread"))) {
+                $g_affinity_string_lsf = "affinity[thread(1):distribute=balance";
+            } elsif ("core" eq substr($g_cpu_bind_slurm, 0, length("core"))) {
+                local $l_th_cnt = $g_total_threads_limt / $g_total_cores_limt;
+
+# in slurm, different tasks can share same socket/core/thread
+# in lsf, cannot; so, to make sure job can be started, adjust the binding thread number
+# if not reasonable, just comment below "if" clause.
+                if ($l_th_cnt > $g_total_threads_limt / $g_ntasks_per_node_option_slurm) {
+                    $l_th_cnt =  $g_total_threads_limt / $g_ntasks_per_node_option_slurm;
+                    if ($l_th_cnt < 1) {
+                        $l_th_cnt = 1;
+                    }
+                }
+                $g_affinity_string_lsf = "affinity[thread($l_th_cnt,same=core):distribute=balance";
+
+            } elsif ("socket" eq substr($g_cpu_bind_slurm, 0, length("socket"))) {
+                local $l_th_cnt = $g_total_threads_limt / $g_total_processors_limt;
+                if ($l_th_cnt > $g_total_threads_limt / $g_ntasks_per_node_option_slurm) {
+                    $l_th_cnt =  $g_total_threads_limt / $g_ntasks_per_node_option_slurm;
+                    if ($l_th_cnt < 1) {
+                        $l_th_cnt = 1;
+                    }
+                }
+                $g_affinity_string_lsf = "affinity[thread($l_th_cnt,same=socket):distribute=balance";
+            } elsif ("rank" eq substr($g_cpu_bind_slurm, 0, length("rank"))) {
+                $g_affinity_string_lsf = "affinity[thread(1):distribute=pack";
+            }
+
+            if ($g_mem_bind_slurm ne "") {
+                print DBGFILE "g_mem_bind_slurm: $g_mem_bind_slurm\n";
+                if ($g_mem_bind_slurm eq "local") {
+                    $g_affinity_string_lsf .= ":membind=localonly";
+                }
+            }
+            $g_affinity_string_lsf .= "]";
+        } else {
+            if ($g_mem_bind_slurm ne "") {
+                print DBGFILE "g_mem_bind_slurm: $g_mem_bind_slurm\n";
+                if ($g_mem_bind_slurm eq "local") {
+                    $g_affinity_string_lsf = "affinity[membind=localonly]";
+                }
+            }
+        }
+
+        if ($g_affinity_string_lsf ne "") {
+            $g_cli_lsf .= " -n $g_ntasks_option_slurm -R \"span[ptile=$g_ntasks_per_node_option_slurm] $g_affinity_string_lsf\"";
+        } else {
+            $g_cli_lsf .= " -n $g_ntasks_option_slurm -R \"span[ptile=$g_ntasks_per_node_option_slurm]\"";
+        }
+    } else { # SelectType=select/cons_res
+# TODO
+        if ($g_ntasks_per_core_slurm ne "") {
+            print DBGFILE "g_ntasks_per_core_slurm: $g_ntasks_per_core_slurm\n";
+        }
+
+        if ($g_ntasks_per_socket_slurm ne "") {
+            print DBGFILE "g_ntasks_per_socket_slurm: $g_ntasks_per_socket_slurm\n";
+        }
+
+        if ($SelectTypeParameters eq "socket") { 
+
+        } elsif ($SelectTypeParameters eq "core") {
+
+        } elsif ($SelectTypeParameters eq "thread") {
+
+        }
+
+        if ($g_cpu_bind_slurm ne "") {
+        }
+        if ($g_mem_bind_slurm ne "") {
+        }
+    }
+}
+
+
+$SIG{'INT'} = 'signal_handler'; 
+$SIG{'ABRT'} = 'signal_handler';
+# ...
+
+
+if ($srun_batch_mode == 1) {
+    # support srun options: -n --ntask-per-node
+    if (($ntasks_configured == 1) and ($ntasks_per_node_configured == 1)) {
+        # in some slurm case, the job can also be started, but in lsf, cannot
+        # for example: 
+        # job1:
+        # script file: srun -n7 --ntasks-per-node=3 user_program, sbatch -n8 --ntasks-per-node=4 the script
+        # (4 tasks on the first node, and 3 tasks on the second node)
+
+        # job2:
+        # script file: srun -n9 --ntasks-per-node=3 user_program, sbatch -n8 --ntasks-per-node=4 the script
+        # (srun: error: Unable to create job step: More processors requested than permitted)
+
+        # job3:
+        # script file: srun -n9 --ntasks-per-node=3 user_program, sbatch -n8 --ntasks-per-node=5 the script
+        # (5 tasks on the first node, and 4 tasks on the second node)
+
+        # job4:
+        # script file: srun -n4 --ntasks-per-node=3 user_program, sbatch -n8 --ntasks-per-node=5 the script
+        # (2 tasks on the first node, and 2 tasks on the second node)
+
+        # designed rule:
+        # 1. reject job when $g_ntasks_option_slurm > $g_sbatch_ntasks (job2 & 3 cannot be submitted in lsf)
+        # otherwise
+        # 2.1 blaunch user_program if $g_ntasks_option_slurm == $g_sbatch_ntasks
+        # 2.2 adjust --ntasks-per-node value to 2, construct -z 'hostname ...' for blaunch command 
+        if ($g_ntasks_option_slurm > $g_sbatch_ntasks) {
+            print DBGFILE __LINE__." $pname: error: Unable to create job step: More processors requested than permitted\n";
+            print STDERR "$pname: error: Unable to create job step: More processors requested than permitted\n";
+            exit(1);
+        } elsif ($g_ntasks_option_slurm == $g_sbatch_ntasks) {
+            $g_cli_lsf = "blaunch $g_executable_args"; 
+        } else { # construct -z options of blaunch
+=pod
+adjust $g_ntasks_per_node_option_slurm according slurm behavior
+
+in slurm, the host allocation consider load-balance firstly.
+for example:
+c66u01b6:~ # srun -n5 --ntasks-per-node=4 -l hostname
+3: c66u01b6
+1: c66u01b5
+4: c66u01b6
+0: c66u01b5
+2: c66u01b5
+c66u01b6:~ #
+(first 3 tasks on the first node, and remind 2 tasks on the second node)
+
+in lsf, bsub -n5 ... span[ptile=4] ... blaunch ..., the result is 4 tasks on first node, and 1 task on the second node
+
+the wrapper will try-best to achieve the load-balance as slurm behavior.
+[c66u01b5][/u/wugyuan/myslurm]> ./mysrun -n5 --ntasks-per-node=4 /bin/hostname
+c66u01b5
+c66u01b5
+c66u01b6
+c66u01b6
+c66u01b6
+[c66u01b5][/u/wugyuan/myslurm]>
+
+however, for some case, the allocation maybe still different:
+(below case is not verified yet)
+-n7 --ntasks-per-node=3, in slurm, the tasks maybe 3, 2, 2, on three nodes.
+in lsf, it is 3, 3, 1.
+in the wrapper, it is 3, 3, 1.
+
+=cut
+
+            local $min_ntasks_per_node = 
+                $g_ntasks_per_node_option_slurm > $g_sbatch_ntasks_per_node ? $g_sbatch_ntasks_per_node : $g_ntasks_per_node_option_slurm;
+            local $tmp_cnt = $g_ntasks_option_slurm / $min_ntasks_per_node;
+            local $min_node = int($tmp_cnt) == $tmp_cnt ? $tmp_cnt : int($tmp_cnt) + 1;
+            if ($min_node * $min_ntasks_per_node != $g_ntasks_option_slurm) {
+                $tmp_cnt = $g_ntasks_option_slurm / $min_node;
+                $g_ntasks_per_node_option_slurm = int($tmp_cnt) == $tmp_cnt ? $tmp_cnt : int($tmp_cnt) + 1;
+                print DBGFILE "adjusted g_ntasks_per_node_option_slurm: $g_ntasks_per_node_option_slurm\n";
+            }
+
+            # use $g_ntasks_option_slurm and $g_ntasks_per_node_option_slurm to contruct -z list
+            local $mlist = generate_mlist();
+            print DBGFILE __LINE__." mlist: $mlist\n";
+            $g_cli_lsf = "blaunch -z \"$mlist\" $g_executable_args";
+        }
+    } elsif ($ntasks_configured == 1) { # only -n
+        if ($g_ntasks_option_slurm > $g_sbatch_ntasks) {
+            # in some slurm case, the job can also be started, but in lsf, cannot
+            print DBGFILE __LINE__."$pname: error: Unable to create job step: More processors requested than permitted\n";
+            print STDERR "$pname: error: Unable to create job step: More processors requested than permitted\n";
+            exit(1);
+        } elsif ($g_ntasks_option_slurm < $g_sbatch_ntasks) {
+            local $mlist = generate_mlist();
+            print DBGFILE __LINE__." mlist: $mlist\n";
+            $g_cli_lsf = "blaunch -z \"$mlist\" $g_executable_args";
+        } else {
+            $g_cli_lsf = "blaunch $g_executable_args"; 
+        }
+    } elsif ($ntasks_per_node_configured == 1) { # only --ntasks-per-node
+        if ($g_ntasks_per_node_option_slurm > $g_sbatch_ntasks_per_node) {
+            print DBGFILE __LINE__." $pname: error: Unable to create job step: More processors requested than permitted\n";
+            print STDERR "$pname: error: Unable to create job step: More processors requested than permitted\n";
+            exit(1);
+        } elsif ($g_ntasks_per_node_option_slurm < $g_sbatch_ntasks_per_node) {
+            local $mlist = generate_mlist();
+            print DBGFILE __LINE__." mlist: $mlist\n";
+            $g_cli_lsf = "blaunch -z \"$mlist\" $g_executable_args";
+        } else {
+            $g_cli_lsf = "blaunch $g_executable_args"; 
+        }
+    } else {
+        $g_cli_lsf = "blaunch $g_executable_args"; 
+    }
+    print DBGFILE "converted lsf cli: $g_cli_lsf\n";
+    print `$g_cli_lsf`; 
+} else {
+    print DBGFILE "generate one tmp file by function tmpnam() ...: \n";
+    # try new temporary filenames until we get one that didn't already exist
+    do { $g_cli_error_tmp_file = tmpnam() }
+    until IO::File->new($g_cli_error_tmp_file, O_RDWR|O_CREAT|O_EXCL);
+
+    print DBGFILE "$g_cli_error_tmp_file.\n";
+
+    $g_cli_lsf .= " \"blaunch $g_executable_args\" 2> $g_cli_error_tmp_file  | grep -v \"is submitted to\"";
+    print DBGFILE "converted lsf cli: $g_cli_lsf\n";
+    system "$g_cli_lsf";
+
+    print DBGFILE `cat $g_cli_error_tmp_file`;
+    $err_msg_lsf = `cat $g_cli_error_tmp_file | grep -v "Waiting for dispatch" | grep -v "Starting on"`;
+    if ($err_msg_lsf ne "") {
+        if ($err_msg_lsf =~ /Too many tasks requested. Job not submitted./) {
+            print STDERR "$pname: error: Unable to allocate resources: Requested node configuration is not available.\n";
+        } else {
+            print STDERR "$pname: $err_msg_lsf\n";
+        }
+        exit (1);
+    }
+}
+
+
+close_debug_file();
+if (-e $g_cli_error_tmp_file) {
+    unlink($g_cli_error_tmp_file); 
+}
+
+# atexit-style handler
+END { 
+    close_debug_file();
+    if (-e $g_cli_error_tmp_file) {
+        unlink($g_cli_error_tmp_file); 
+    }
+}
+

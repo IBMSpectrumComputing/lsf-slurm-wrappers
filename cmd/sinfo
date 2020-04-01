@@ -1,0 +1,597 @@
+#!/usr/bin/perl
+#
+# Copyright International Business Machines Corp, 2018.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+#=============================================================================
+# File        : sinfo
+# Description : sinfo wrapper used in lsf cluster
+#
+# Author      : Guang Yuan Wu (wugyuan@cn.ibm.com)
+#
+#=============================================================================
+# Declaration of required modules and/or Perl libraries
+#=============================================================================
+
+use Getopt::Std;
+use File::Basename qw<basename dirname>;
+
+use Getopt::Long;
+Getopt::Long::Configure("bundling", "no_ignore_case");
+
+use IO::Handle;
+STDOUT->autoflush(1);
+STDERR->autoflush(1);
+
+my ($debug) = 0; # 0: on/off debug depends on env SLURM_TO_LSF_DEBUG and SLURM_TO_LSF_DEBUG_SINFO
+my $pname = basename $0;
+
+# supported options
+my $g_help_option_slurm = 0;
+my $g_usage_option_slurm = 0;
+
+my $g_all_option_slurm = "";
+my $g_long_option_slurm = "";
+my $g_partition_option_slurm = "";
+my $g_capital_node_option_slurm = "";
+my $g_nodes_option_slurm = "";
+
+my (%g_queues_info);
+# key: queue_name, value: PARTITION,AVAIL,TIMELIMIT,JOB_SIZE,ROOT,OVERSUBS,GROUPS,NODES,STATE,NODELIST
+
+# sinfo -l
+# Wed Aug 24 03:22:11 2016
+# PARTITION AVAIL  TIMELIMIT   JOB_SIZE ROOT OVERSUBS     GROUPS  NODES       STATE NODELIST
+# control    down   infinite 1-infinite   no       NO        all      1        idle c66u01b6
+# compute*     up   infinite 1-infinite   no       NO        all      2        idle c66u01b[5-6]
+
+
+
+my $g_default_queues = "";
+
+#=============================================================================
+# sub routine: open_debug_file 
+# Input arguements: nothing
+# Return value: nothing
+#=============================================================================
+sub open_debug_file {
+    if ($debug == 0) {
+        if (($ENV{"SLURM_TO_LSF_DEBUG"} ne "") || ($ENV{"SLURM_TO_LSF_DEBUG_SINFO"} ne "")) {
+            $debug = 1;
+        }
+    }
+
+    if ($debug) { # debug messages dumps to /tmp/sinfo.uid.pid
+        open DBGFILE, ">/tmp/$pname.$ENV{'USER'}.$$" or die "can't open /tmp/$pname.$ENV{'USER'}.$$ file to write\n";
+
+        print DBGFILE "execution time : ";
+        print DBGFILE scalar localtime;
+        print DBGFILE "\n";
+        print DBGFILE "pid  : ".$$."\n";
+        print DBGFILE "ruid : ".$<."\n";
+        print DBGFILE "euid : ".$>."\n";
+        print DBGFILE "user : ".$ENV{'USER'}."\n";
+        print DBGFILE "pwd  : ".$ENV{'PWD'}."\n";
+        print DBGFILE "home : ".$ENV{'HOME'}."\n";
+        print DBGFILE "host : ".$ENV{'HOST'}."\n";
+        print DBGFILE "hostn: ".$ENV{'HOSTNAME'}."\n";
+
+        print DBGFILE "LSF_BINDIR: ".$ENV{'LSF_BINDIR'}."\n";
+        print DBGFILE "argv: @ARGV\n";
+
+    }
+}
+
+#=============================================================================
+# sub routine: close_debug_file 
+# Input arguements: nothing
+# Return value: nothing
+#=============================================================================
+sub close_debug_file {
+    if ($debug) {
+        close(DBGFILE);
+    }
+}
+
+#=============================================================================
+# sub routine: showShortUsage
+# Input arguements: nothing
+# Return value: nothing
+#=============================================================================
+sub showShortUsage {
+    print STDOUT << "EndOfUsage";
+Usage: $pname [-alN] [-p partition]
+EndOfUsage
+
+# [-n nodes]
+}
+
+#=============================================================================
+# sub routine: showUsage
+# Input arguements: nothing
+# Return value: nothing
+#=============================================================================
+sub showUsage {
+    print STDOUT << "EndOfUsage";
+Usage: sinfo [OPTIONS]
+  -a, --all                  show all partitions (including hidden and those
+                             not accessible)
+  -l, --long                 long output - displays more information
+  -N, --Node                 Node-centric format 
+  -p, --partition=PARTITION  report on specific partition
+
+Help options:
+  --help                     show this help message
+  --usage                    display brief usage message
+EndOfUsage
+
+  # -n, --nodes=NODES          report on specific node(s)
+}
+
+
+#====================================================================================
+# sub routine: parseOptions
+# Input arguements: nothing
+# Return value:  nothing
+#====================================================================================
+sub parseOptions
+{
+    local $ret = 0;
+
+    $ret = GetOptions( 
+            'help|h' => \$g_help_option_slurm,
+            'usage' => \$g_usage_option_slurm,
+            'all|a' => \$g_all_option_slurm,
+            'long|l' => \$g_long_option_slurm,
+            'Node|N' => \$g_capital_node_option_slurm,
+            #'nodes|n=s' => \$g_nodes_option_slurm,
+            'partition|p=s' => \$g_partition_option_slurm,
+            ); 
+
+    print DBGFILE __LINE__." ret: $ret\n";
+    if (1 != $ret) {
+        close_debug_file();
+        exit (1);
+    }
+
+    return;
+}
+
+#====================================================================================
+# sub routine: getSCT
+# Input arguements: Node hostname
+# Return value: (total_threads, S:C:T) 
+#====================================================================================
+sub getNodeSCT
+{
+    my $hostname = shift;
+    my $ret = "";
+    my $bsub_full_pathname = `which bsub`;
+    chomp($bsub_full_pathname);
+    ($bsub_path, $bsub_name) = $bsub_full_pathname =~ m|^(.*[/\\])([^/\\]+?)$|;
+    my $lsf_profile = $bsub_path."../../../conf/profile.lsf";
+    local $total_numa = 0;
+    local $total_pro = 0;
+    local $total_core = 0;
+    local $total_thread = 0;
+    
+    my $short_hostname = (split(/\./, $hostname))[0];
+
+    my $lim_t_output = `rsh $short_hostname ". $lsf_profile;lim -t"`;
+    print DBGFILE "rsh $short_hostname \". $lsf_profile;lim -t\":\n***$lim_t_output\n***\n";
+    my @node_info = split(/\n/, $lim_t_output);
+    for ($node_info_idx = 1; $node_info_idx <= $#node_info; $node_info_idx++) {
+        @one_line_info = split(/:/, $node_info[$node_info_idx], 2);
+        if($one_line_info[0] =~ /Total NUMA Nodes/) {
+            $total_numa = $one_line_info[1];
+            $total_numa =~ s/ +$//g;
+        } elsif ($one_line_info[0] =~ /Total Processors/) {
+            $total_pro = $one_line_info[1];
+            $total_pro =~ s/ +$//g;
+        } elsif ($one_line_info[0] =~ /Total Cores/) {
+            $total_core = $one_line_info[1];
+            $total_core =~ s/ +$//g;
+        } elsif ($one_line_info[0] =~ /Total Threads/) {
+            $total_thread = $one_line_info[1];
+            $total_thread =~ s/ +$//g;
+        } else {
+            next;
+        }
+    }
+    print DBGFILE "$short_hostname:total_numa-$total_numa, total_pro-$total_pro, total_core-$total_core, total_thread-$total_thread \n";
+    my $node_SCT_str = $total_pro.":".$total_core/$total_pro.":".$total_thread/$total_core;
+    print DBGFILE "$short_hostname S:C:T --- $node_SCT_str\n";
+    return ($total_thread, $node_SCT_str);
+}
+
+#******************************************************************************
+# main
+#******************************************************************************
+
+if ($ENV{'LSF_BINDIR'} eq "") {
+    print STDERR "$pname: please source LSF configure profile.\n";
+    exit(1);
+}
+
+open_debug_file();
+
+parseOptions();
+
+if (1 == $g_help_option_slurm) {
+    showUsage();
+    close_debug_file();
+    exit (0);
+}
+
+if (1 == $g_usage_option_slurm) {
+    showShortUsage();
+    close_debug_file();
+    exit (0);
+}
+
+if (1 == $g_all_option_slurm) {
+    print DBGFILE "g_all_option_slurm: $g_all_option_slurm\n";
+    if ($g_partition_option_slurm ne "") {
+        print DBGFILE "g_partition_option_slurm: $g_partition_option_slurm\n";
+        print STDERR "$pname: error: Conflicting options, -a and -p, specified. Please choose one or the other.\n";
+        close_debug_file();
+        exit(1);
+        
+    }
+}
+
+if (1 == $g_long_option_slurm) {
+    print DBGFILE "g_long_option_slurm: $g_long_option_slurm\n";
+}
+
+if (1 == $g_capital_node_option_slurm) {
+    print DBGFILE "g_capital_node_option_slurm: $g_capital_node_option_slurm\n";
+}
+
+if ($g_nodes_option_slurm ne "") {
+    print DBGFILE "g_nodes_option_slurm: $g_nodes_option_slurm\n";
+}
+
+if ($g_partition_option_slurm ne "") {
+    print DBGFILE "g_partition_option_slurm: $g_partition_option_slurm\n";
+}
+
+# get default queues by bparams command
+# cannot depend on bqueues -l output 
+# (Text "This is the default queue" may be existed in description of file lsb.queues)
+print DBGFILE "execute bparams ...\n";
+$g_default_queues = `bparams | grep "Default Queues" | awk -F: '{print \$2;}'`;
+print DBGFILE "g_default_queues: $g_default_queues\n";
+
+# get each node state from bhosts output
+my %l_hosts_info; # key: hostname, value: hostname,status,max,run,cpu,S:C:T
+print DBGFILE "execute bhosts ...\n";
+my $bhosts_output = `bhosts`;
+print DBGFILE "bhosts:\n***$bhosts_output\n***\n";
+my @all_hosts = split(/\n/, $bhosts_output);
+for ($hosts_idx = 1; $hosts_idx <= $#all_hosts; $hosts_idx++) {
+    @one_host = split(/[ \t]+/, $all_hosts[$hosts_idx]);
+    $l_hosts_info{$one_host[0]} = "$one_host[0],$one_host[1],$one_host[3],$one_host[5]";
+    ($tmp_total_cpus, $tmp_node_SCT) = getNodeSCT($one_host[0]);
+    $l_hosts_info{$one_host[0]} .= ",".$tmp_total_cpus;
+    $l_hosts_info{$one_host[0]} .= ",".$tmp_node_SCT;
+    print DBGFILE "l_hosts_info: $l_hosts_info{$one_host[0]}.\n";
+}
+
+# parse queues information from bqueues -l
+print DBGFILE "execute bqueues ...\n";
+my $bqueues_l_out = `bqueues -l`;
+print DBGFILE "bqueues -l:\n***$bqueues_l_out\n***\n";
+my @all_queues = split(/QUEUE: /, $bqueues_l_out);
+my $qname = "";
+for ($i = 1; $i <= $#all_queues; $i++) {
+    local @one_queue = ();
+    @one_queue = split(/\n/, $all_queues[$i]);
+    chomp($one_queue[0]);
+    $qname = $one_queue[0];
+    if ($g_default_queues =~ /$qname/) {
+        $g_queues_info{$qname} = "$qname*";
+    } else {
+        $g_queues_info{$qname} = "$qname";
+    }
+
+    print DBGFILE "process queue $qname\n";
+    # key: queue_name, value: PARTITION,AVAIL,TIMELIMIT,JOB_SIZE,ROOT,OVERSUBS,GROUPS,NODES,STATE,NODELIST
+    # AVAIL
+    for ($q_idx = 1; $q_idx <= $#one_queue; $q_idx++) {
+        if ($one_queue[$q_idx] =~ /PRIO NICE STATUS/) {
+            $q_idx++;
+            if ($one_queue[$q_idx] =~ /Closed:/) {
+                $g_queues_info{$qname} .= ","."down";
+            } else {
+                $g_queues_info{$qname} .= ","."up";
+            }
+            last;
+        }
+    }
+    if ($q_idx > $#one_queue) {
+        $g_queues_info{$qname} .= ","."up"; # default set to up ??
+    }
+
+    # TIMELIMIT
+    for ($q_idx = 1; $q_idx <= $#one_queue; $q_idx++) {
+        if ($one_queue[$q_idx] =~ /RUNLIMIT/) {
+            $q_idx++;
+            chomp($one_queue[$q_idx]);
+            $g_queues_info{$qname} .= ",".$one_queue[$q_idx];
+            last;
+        }
+    }
+    if ($q_idx > $#one_queue) {
+        $g_queues_info{$qname} .= ","."infinite";
+    }
+
+    # JOB_SIZE
+    for ($q_idx = 1; $q_idx <= $#one_queue; $q_idx++) {
+        if ($one_queue[$q_idx] =~ /JOB_SIZE_LIST/) {
+            $q_idx++;
+            chomp($one_queue[$q_idx]);
+            $g_queues_info{$qname} .= ",".$one_queue[$q_idx];
+            last;
+        }
+    }
+    if ($q_idx > $#one_queue) {
+        $g_queues_info{$qname} .= ","."1-infinite";
+    }
+
+    # ROOT
+    $g_queues_info{$qname} .= ","."no";
+    # OVERSUBS 
+    $g_queues_info{$qname} .= ","."NO";
+    
+    # GROUPS
+    for ($q_idx = 1; $q_idx <= $#one_queue; $q_idx++) {
+        if ($one_queue[$q_idx] =~ /USERS: /) {
+            $one_queue[$q_idx] =~ s/USERS: //;
+            $one_queue[$q_idx] =~ s/ *$//;
+            chomp($one_queue[$q_idx]);
+            $g_queues_info{$qname} .= ",".$one_queue[$q_idx];
+            last;
+        }
+    }
+    if ($q_idx > $#one_queue) {
+        $g_queues_info{$qname} .= ","."all";
+    }
+
+    # NODES,STATE,NODELIST
+    for ($q_idx = 1; $q_idx <= $#one_queue; $q_idx++) {
+        if ($one_queue[$q_idx] =~ /HOSTS: /) {
+            $one_queue[$q_idx] =~ s/HOSTS://;
+            $one_queue[$q_idx] =~ s/ *$//;
+            chomp($one_queue[$q_idx]);
+            
+            if ($one_queue[$q_idx] =~ /all/) { # need special handling: delete "alloc/mix, or n/a node"
+                local $hnum = $#all_hosts;
+                $g_queues_info{$qname} .= ",$hnum,idle,all";
+            } else {
+                local $num_alloc = 0, $num_mix = 0, $num_idle = 0;
+                local $alloc_hosts = "", $mix_hosts = "", $idle_hosts = "";
+
+                local @hosts_per_queue = split(/[ \t]+/, $one_queue[$q_idx]);
+                for ($qhosts_idx = 1; $qhosts_idx <= $#hosts_per_queue; $qhosts_idx++) {
+                    local $tmp_hname = $hosts_per_queue[$qhosts_idx];
+                    foreach $hkeys (keys %l_hosts_info) {
+                        if (($hkeys =~ /$hosts_per_queue[$qhosts_idx]/) or ($hosts_per_queue[$qhosts_idx] =~ /$hkeys/)) {
+                            @hostinfo = split(/,/, $l_hosts_info{$hkeys});
+                            if ($hostinfo[1] ne "unavail") {
+                                if ($hostinfo[2] eq $hostinfo[3]) {
+                                    $num_alloc++;
+                                    if ($alloc_hosts eq "") {
+                                        $alloc_hosts = "$hosts_per_queue[$qhosts_idx]";
+                                    } else {
+                                        $alloc_hosts .= ",$hosts_per_queue[$qhosts_idx]";
+                                    }
+                                } else {
+                                    if ($hostinfo[3] > 0) {
+                                        $num_mix++;
+                                        if ($mix_hosts eq "") {
+                                            $mix_hosts = "$hosts_per_queue[$qhosts_idx]";
+                                        } else {
+                                            $mix_hosts .= ",$hosts_per_queue[$qhosts_idx]";
+                                        }
+                                    } else {
+                                        $num_idle++;
+                                        if ($idle_hosts eq "") {
+                                            $idle_hosts = "$hosts_per_queue[$qhosts_idx]";
+                                        } else {
+                                            $idle_hosts .= ",$hosts_per_queue[$qhosts_idx]";
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                print DBGFILE "num_alloc=$num_alloc, num_mix=$num_mix, num_idle=$num_idle.\n";
+                if ((0 == $num_alloc) and (0 == $num_mix) and (0 == $num_idle)) {
+                    $g_queues_info{$qname} .= ",0,n/a, ";
+                } else {
+                    local $prefix = $g_queues_info{$qname};
+                    if ($num_alloc > 0) {
+                        $g_queues_info{$qname} .= ",$num_alloc,alloc,$alloc_hosts";
+                        if ($num_mix > 0) {
+                            $g_queues_info{$qname} .= "::$prefix,$num_mix,mix,$mix_hosts";
+                        }
+                        if ($num_idle > 0) {
+                            $g_queues_info{$qname} .= "::$prefix,$num_idle,idle,$idle_hosts";
+                        }   
+                    } else {
+                        if ($num_mix > 0) {
+                            $g_queues_info{$qname} .= ",$num_mix,mix,$mix_hosts";
+                            if ($num_idle > 0) {
+                                $g_queues_info{$qname} .= "::$prefix,$num_idle,idle,$idle_hosts";
+                            }   
+                        } else {
+                            if ($num_idle > 0) {
+                                $g_queues_info{$qname} .= ",$num_idle,idle,$idle_hosts";
+                            }
+                        }
+                    }
+                }
+            }
+
+            last;
+        }
+    }
+    
+    print DBGFILE "g_queues_info: $g_queues_info{$qname}.\n";
+    
+}
+
+
+if (1 == $g_long_option_slurm) {
+    print `date`;
+    if (1 == $g_capital_node_option_slurm) {
+        print "NODELIST   NODES PARTITION       STATE CPUS     S:C:T MEMORY TMP_DISK WEIGHT AVAIL_FE REASON\n";
+    } else {
+        print "PARTITION    AVAIL  TIMELIMIT   JOB_SIZE ROOT OVERSUBS     GROUPS  NODES       STATE NODELIST\n";
+    }
+} else {
+    if (1 == $g_capital_node_option_slurm) {
+        print "NODELIST   NODES PARTITION       STATE\n";
+    } else {
+        print "PARTITION    AVAIL  TIMELIMIT    NODES      STATE NODELIST\n";
+    }
+    
+}
+
+if ($g_partition_option_slurm ne "") { # -p
+    local @query_partitions = split(/[,]+/, $g_partition_option_slurm);
+    if (1 == $g_capital_node_option_slurm) {
+        foreach $hkeys (keys %l_hosts_info) {
+            @one_host = split(/,/, $l_hosts_info{$hkeys});
+            foreach $qkeys (keys %g_queues_info) {
+                @one_queues = split(/::/, $g_queues_info{$qkeys});
+                for ($q_idx = 0; $q_idx <= $#one_queues; $q_idx++) {
+                    @one_output_line = split(/,/, $one_queues[$q_idx], 10);
+                    for ($query_idx = 0; $query_idx <= $#query_partitions; $query_idx++) {
+                        if (($query_partitions[$query_idx] eq $one_output_line[0]) or ($one_output_line[0] eq $query_partitions[$query_idx]."*")) {
+                            if (($hkeys =~ /$one_output_line[9]/) or ($one_output_line[9] =~ /all/)) {
+                                printf ("%-10s ", (split(/\./, $hkeys))[0]); # NODELIST   
+                                printf ("%5s ", "1"); # NODES
+                                printf ("%9s       ", $one_output_line[0]);#PARTITION
+                                printf ("%5s ", $one_output_line[8]); # STATE
+                                if (1 == $g_long_option_slurm) {
+                                    printf ("%4s    ", $one_host[4]); # CPUS  
+                                    printf ("%5s ", $one_host[5]); # S:C:T     
+                                    printf ("%6s ", "500"); # MEMORY    
+                                    printf ("%8s ", "0"); # TMP_DISK   
+                                    printf ("%6s ", "1"); # WEIGHT  
+                                    printf ("%8s ", "(null)"); # AVAIL_FE 
+                                    printf ("%6s ", "none"); # REASON
+                                }
+                                print "\n";
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        # local @query_partitions = split(/[,]+/, $g_partition_option_slurm);
+        for ($query_idx = 0; $query_idx <= $#query_partitions; $query_idx++) {
+            foreach $qkeys (keys %g_queues_info) {
+                @one_queues = split(/::/, $g_queues_info{$qkeys});
+                for ($q_idx = 0; $q_idx <= $#one_queues; $q_idx++) {
+                    @one_output_line = split(/,/, $one_queues[$q_idx], 10);
+                    # if (($query_partitions[$query_idx] =~ /$one_output_line[0]/) or ($one_output_line[0] =~ /$query_partitions[$query_idx]/)) {
+                    if (($query_partitions[$query_idx] eq $one_output_line[0]) or ($one_output_line[0] eq $query_partitions[$query_idx]."*")) {
+                        printf ("%-12s ", $one_output_line[0]); # PARTITION
+                        printf ("%5s ", $one_output_line[1]); # AVAIL
+                        $one_output_line[2] =~ s/ min//;
+                        printf ("%10s ", $one_output_line[2]); # TIMELIMIT
+                        if (1 == $g_long_option_slurm) {
+                            if (!($one_output_line[3] =~ /infinite/)) {
+                                $one_output_line[3] =~ /(\d+)/;
+                                printf ("%12s ", $1); # JOB_SIZE
+                            } else {
+                                printf ("%12s ", $one_output_line[3]); # JOB_SIZE
+                            }
+                            printf ("%4s ", $one_output_line[4]); # ROOT
+                            printf ("%4s ", $one_output_line[5]); # OVERSUBS
+                            printf ("%10s ", $one_output_line[6]); # GROUPS
+                        }
+                        printf ("%8s ", $one_output_line[7]); # NODES
+                        printf ("%10s ", $one_output_line[8]); # STATE
+                        printf ("%s ", $one_output_line[9]); # NODELIST
+                        print "\n";
+                    }
+                }
+            }
+        }
+    }
+} else { # [-a]
+    if (1 == $g_capital_node_option_slurm) {
+        foreach $hkeys (keys %l_hosts_info) {
+            @one_host = split(/,/, $l_hosts_info{$hkeys});
+            foreach $qkeys (keys %g_queues_info) {
+                @one_queues = split(/::/, $g_queues_info{$qkeys});
+                for ($q_idx = 0; $q_idx <= $#one_queues; $q_idx++) {
+                    @one_output_line = split(/,/, $one_queues[$q_idx], 10);
+                    if (($hkeys =~ /$one_output_line[9]/) or ($one_output_line[9] =~ /all/)) {
+                        printf ("%-10s ", (split(/\./, $hkeys))[0]); # NODELIST   
+                        printf ("%5s ", "1"); # NODES
+                        printf ("%9s       ", $one_output_line[0]);#PARTITION
+                        printf ("%5s ", $one_output_line[8]); # STATE
+                        if (1 == $g_long_option_slurm) {
+                            printf ("%4s    ", $one_host[4]); # CPUS  
+                            printf ("%5s ", $one_host[5]); # S:C:T     
+                            printf ("%6s ", "500"); # MEMORY    
+                            printf ("%8s ", "0"); # TMP_DISK   
+                            printf ("%6s ", "1"); # WEIGHT  
+                            printf ("%8s ", "(null)"); # AVAIL_FE 
+                            printf ("%6s ", "none"); # REASON
+                        }
+                        print "\n";
+                    }
+                }
+            }
+        }
+    } else {
+        foreach $qkeys (keys %g_queues_info) {
+            @one_queues = split(/::/, $g_queues_info{$qkeys});
+            for ($q_idx = 0; $q_idx <= $#one_queues; $q_idx++) {
+                @one_output_line = split(/,/, $one_queues[$q_idx], 10);
+                printf ("%-12s ", $one_output_line[0]); # PARTITION
+                printf ("%5s ", $one_output_line[1]); # AVAIL
+                $one_output_line[2] =~ s/ min//;
+                printf ("%10s ", $one_output_line[2]); # TIMELIMIT
+                if (1 == $g_long_option_slurm) {
+                    if (!($one_output_line[3] =~ /infinite/)) {
+                        $one_output_line[3] =~ /(\d+)/;
+                        printf ("%12s ", $1); # JOB_SIZE
+                    } else {
+                        printf ("%12s ", $one_output_line[3]); # JOB_SIZE
+                    }
+                    printf ("%4s ", $one_output_line[4]); # ROOT
+                    printf ("%4s ", $one_output_line[5]); # OVERSUBS
+                    printf ("%10s ", $one_output_line[6]); # GROUPS
+                }
+                printf ("%8s ", $one_output_line[7]); # NODES
+                printf ("%10s ", $one_output_line[8]); # STATE
+                printf ("%s ", $one_output_line[9]); # NODELIST
+                print "\n";
+            }
+        }
+    }
+}
+
+
+close_debug_file();
+

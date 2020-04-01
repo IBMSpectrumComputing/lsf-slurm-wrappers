@@ -1,0 +1,663 @@
+#!/usr/bin/perl
+#
+# Copyright International Business Machines Corp, 2018.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+#=============================================================================
+# File        : 
+# Description : sbatch wrapper used in lsf cluster
+#             : LSB_JOB_OUTPUT_LOGGING=N should be configured ...
+#
+# Author      : Guang Yuan Wu (wugyuan@cn.ibm.com)
+#
+#=============================================================================
+# Declaration of required modules and/or Perl libraries
+#=============================================================================
+
+use Getopt::Std;
+use File::Basename qw<basename dirname>;
+
+use Cwd;
+use Cwd qw(abs_path);
+
+use Getopt::Long;
+use Getopt::Long qw(GetOptionsFromArray);
+Getopt::Long::Configure("bundling", "no_ignore_case", "pass_through");
+
+use IO::File;
+use POSIX qw(tmpnam);
+
+use IO::Handle;
+STDOUT->autoflush(1);
+STDERR->autoflush(1);
+
+my ($debug) = 0; # 0: on/off debug depends on env SLURM_TO_LSF_DEBUG and SLURM_TO_LSF_DEBUG_SBATCH
+my $pname = basename $0;
+
+my $g_cli_lsf = "bsub -oo slurm-%J.out";
+my $g_host_mxj = 0;
+my $g_executable_args = "";
+my $g_executable = "";
+
+# supported options
+my $g_help_option_slurm = 0;
+my $g_usage_option_slurm = 0;
+
+my $g_error_option_slurm = ""; # -e, --error=err
+my $g_out_option_slurm = ""; # -o, --output=out
+my $g_open_mode_option_slurm = ""; # default is truncated
+my $g_out_option_lsf = "-oo";
+my $g_error_option_lsf = "-eo";
+
+my $g_workdir_option_slurm = "";
+my $g_begin_option_slurm = "";
+my $g_dependency_option_slurm = "";
+my $g_export_option_slurm = "";
+my $g_exclusive_option_slurm = "";
+my $g_hold_option_slurm = 0;
+my $g_input_option_slurm = "";
+my $g_jname_option_slurm = "";
+my $g_mailuser_option_slurm = "";
+my $g_partition_option_slurm = "";
+my $g_time_option_slurm = "";
+my $g_nodelist_option_slurm = "";
+
+my $g_ntasks_option_slurm = "";
+my $g_ntasks_per_node_option_slurm = "";
+my $g_nodes_option_slurm = "";
+
+my $g_job_script_slurm = ""; # from command line
+my $g_job_script_lsf = ""; # convert slurm script to lsf format, temp file
+my $g_cli_error_tmp_file = ""; # save error output from lsf command
+
+
+#=============================================================================
+# sub routine: open_debug_file 
+# Input arguements: nothing
+# Return value: nothing
+#=============================================================================
+sub open_debug_file {
+    if ($debug == 0) {
+        if (($ENV{"SLURM_TO_LSF_DEBUG"} ne "") || ($ENV{"SLURM_TO_LSF_DEBUG_SBATCH"} ne "")) {
+            $debug = 1;
+        }
+    }
+
+    if ($debug) { # debug messages dumps to /tmp/sbatch.uid.pid
+        open DBGFILE, ">/tmp/$pname.$ENV{'USER'}.$$" or die "can't open /tmp/$pname.$ENV{'USER'}.$$ file to write\n";
+
+        print DBGFILE "execution time : ";
+        print DBGFILE scalar localtime;
+        print DBGFILE "\n";
+        print DBGFILE "pid  : ".$$."\n";
+        print DBGFILE "ruid : ".$<."\n";
+        print DBGFILE "euid : ".$>."\n";
+        #print DBGFILE "rgid : ".$(."\n";
+        #print DBGFILE "egid : ".$)."\n";
+        print DBGFILE "user : ".$ENV{'USER'}."\n";
+        print DBGFILE "pwd  : ".$ENV{'PWD'}."\n";
+        print DBGFILE "home : ".$ENV{'HOME'}."\n";
+        print DBGFILE "host : ".$ENV{'HOST'}."\n";
+        print DBGFILE "hostn: ".$ENV{'HOSTNAME'}."\n";
+
+        print DBGFILE "LSF_BINDIR: ".$ENV{'LSF_BINDIR'}."\n";
+        print DBGFILE "argv: @ARGV\n";
+
+    }
+}
+
+#=============================================================================
+# sub routine: close_debug_file 
+# Input arguements: nothing
+# Return value: nothing
+#=============================================================================
+sub close_debug_file {
+    if ($debug) {
+        close(DBGFILE);
+    }
+}
+
+#=============================================================================
+# sub routine: signal_handler 
+# Input arguements: nothing
+# Return value: nothing
+#=============================================================================
+sub signal_handler {
+    exit(1);
+}
+
+#=============================================================================
+# sub routine: showShortUsage
+# Input arguements: nothing
+# Return value: nothing
+#=============================================================================
+sub showShortUsage {
+    print STDOUT << "EndOfUsage";
+Usage: $pname [-N nnodes] [-n ntasks] [-p partition] [--hold] 
+              [-t minutes] [-D path] [--workdir=directory] 
+              [-J jobname] [--mail-user=user] [--ntasks-per-node=n] 
+              [--export[=names]] executable [args...]
+EndOfUsage
+
+}
+
+#=============================================================================
+# sub routine: showUsage
+# Input arguements: nothing
+# Return value: nothing
+#=============================================================================
+sub showUsage {
+    print STDOUT << "EndOfUsage";
+Usage: $pname [OPTIONS...] executable [args...]
+
+Parallel run options:
+  -D, --workdir=directory     set working directory for batch script
+      --export[=names]        specify environment variables to export
+  -H, --hold                  submit job in held state
+  -J, --job-name=jobname      name of job
+      --mail-user=user        who to send email notification for job state
+                              changes
+  -n, --ntasks=ntasks         number of tasks to run
+      --ntasks-per-node=n     number of tasks to invoke on each node
+  -N, --nodes=N               number of nodes on which to run (N = min[-max])
+  -p, --partition=partition   partition requested
+  -t, --time=minutes          time limit
+
+Consumable resources related options:
+      --exclusive[=user]      allocate nodes in exclusive mode when
+                              cpu consumable resource is enabled
+
+Help options:
+  -h, --help                  show this help message
+      --usage                 display brief usage message
+
+EndOfUsage
+
+}
+
+
+#====================================================================================
+# sub routine: parseOptions
+# Input arguements: nothing
+# Return value:  nothing
+#====================================================================================
+sub parseOptions
+{
+    local @myopts = ();
+
+    local @slurm_cmd_options = ();
+    local @executable_args = ();
+    local $ingore_value;
+
+    @myopts = @ARGV;
+    local $ret = GetOptionsFromArray(\@myopts, 
+            'help|h' => \$ingore_value,
+            'usage' => \$ingore_value,
+            #'error|e=s' => \$ingore_value,
+            #'out|o=s' => \$ingore_value,
+            #'open-mode=s' => \$ingore_value,
+            'workdir|D=s' => \$ingore_value,
+            'export=s' => \$ingore_value,
+            'exclusive=s' => \$ingore_value,
+            'hold|H' => \$ingore_value,
+            #'input|i=s' => \$ingore_value,
+            'job-name|J=s' => \$ingore_value,
+            'mail-user=s' => \$ingore_value,
+            'partition|p=s' => \$ingore_value,
+            'time|t=s' => \$ingore_value,
+            #'nodelist|w=s' => \$ingore_value,
+            'ntasks|n=s' => \$ingore_value,
+            'ntasks-per-node=s' => \$ingore_value,
+            'nodes|N=s' => \$ingore_value,
+            '<>' => sub { push (@executable_args, @_) }
+            );
+    print DBGFILE __LINE__." ret: $ret\n";
+
+    print DBGFILE "executable_args: @executable_args\n";
+    if ($executable_args[0] =~ /^ *-/) { # executable shoulde not start with '-' char
+        print STDERR "$pname: invalid option -- '$executable_args[0]', or not supported by the wrapper\n";
+        print STDERR "Try \"$pname --help\" for more information\n";
+        exit (1);
+    }
+
+    $g_executable = $executable_args[0];
+
+    local $i = 0;
+    local $key = "";
+    foreach $key (@ARGV) {
+        if ($key eq $executable_args[0]) {
+            for ($i; $i <= $#ARGV; $i++) {
+                $g_executable_args .= $ARGV[$i]." ";
+            }
+            last;
+        } else {
+            $slurm_cmd_options[$i] = $key;
+            $i++;
+        }
+    }
+    print DBGFILE "g_executable_args: $g_executable_args\n";
+
+    print DBGFILE "slurm_cmd_options: @slurm_cmd_options\n";
+    $ret = GetOptionsFromArray(\@slurm_cmd_options, 
+            'help|h' => \$g_help_option_slurm,
+            'usage' => \$g_usage_option_slurm,
+            #'error|e=s' => \$g_error_option_slurm,
+            #'out|o=s' => \$g_out_option_slurm,
+            #'open-mode=s' => \$g_open_mode_option_slurm,
+            'workdir|D=s' => \$g_workdir_option_slurm,
+            'export=s' => \$g_export_option_slurm,
+            'exclusive=s' => \$g_exclusive_option_slurm,
+            'hold|H' => \$g_hold_option_slurm,
+            #'input|i=s' => \$g_input_option_slurm,
+            'job-name|J=s' => \$g_jname_option_slurm,
+            'mail-user=s' => \$g_mailuser_option_slurm,
+            'partition|p=s' => \$g_partition_option_slurm,
+            'time|t=s' => \$g_time_option_slurm,
+            #'nodelist|w=s' => \$g_nodelist_option_slurm,
+            'ntasks|n=s' => \$g_ntasks_option_slurm,
+            'ntasks-per-node=s' => \$g_ntasks_per_node_option_slurm,
+            'nodes|N=s' => \$g_nodes_option_slurm,
+            );
+    print DBGFILE __LINE__." ret: $ret\n";
+
+}
+
+#=============================================================================
+# sub routine: job_script_convert 
+# Input arguements: file1 file2
+# Return value: nothing
+#=============================================================================
+sub job_script_convert {
+    local $fin = shift;
+    local $fout = shift;
+
+    open FIN, $fin or die "can't open $fin file to read\n";
+
+    local $all_in_lines = "";
+    while (<FIN>) {
+        chomp($_);
+        if (($_ =~ /^[ \t]*srun[ \t]+(.*)/) or ($_ =~ /^[ \t]*\/usr\/bin\/srun [ \t]+(.*)/)) {
+            local @srun_executable_args = ();
+            local $ingore_value;
+            local @myopts = ();
+            local @saved_myopts = ();
+
+            @myopts = split(/[ \t]+/, $1);
+            @saved_myopts = @myopts;
+
+            # need add all srun options here 
+            local $ret = GetOptionsFromArray(\@myopts, 
+                    'help|h' => \$ingore_value,
+                    'usage' => \$ingore_value,
+                    'error|e=s' => \$ingore_value,
+                    'out|o=s' => \$ingore_value,
+                    'open-mode=s' => \$ingore_value,
+                    'export=s' => \$ingore_value,
+                    'exclusive=s' => \$ingore_value,
+                    'hold|H' => \$ingore_value,
+                    'input|i=s' => \$ingore_value,
+                    'job-name|J=s' => \$ingore_value,
+                    'mail-user=s' => \$ingore_value,
+                    'partition|p=s' => \$ingore_value,
+                    'time|t=s' => \$ingore_value,
+                    'ntasks|n=s' => \$ingore_value,
+                    'ntasks-per-node=s' => \$ingore_value,
+                    'nodes|N=s' => \$ingore_value,
+                    '<>' => sub { push (@srun_executable_args, @_) }
+                    );
+            print DBGFILE __LINE__." ret: $ret\n";
+
+            print DBGFILE "srun_executable_args: @srun_executable_args\n";
+            if ($srun_executable_args[0] =~ /^ *-/) { # executable shoulde not start with '-' char
+                print DBGFILE "unsupported option '$srun_executable_args[0]' for srun\n";
+                print STDERR "srun: invalid option -- '$srun_executable_args[0]', or not supported by the wrapper\n";
+                print STDERR "Try \"srun --help\" for more information\n";
+                exit (1);
+            }
+
+            $all_in_lines .= "blaunch ";
+
+            local $i = 0;
+            local $key = "";
+            foreach $key (@saved_myopts) {
+                if ($key eq $srun_executable_args[0]) {
+                    for ($i; $i <= $#saved_myopts; $i++) {
+                        $all_in_lines .= $saved_myopts[$i]." ";
+                    }
+                    last;
+                } else {
+                    $i++;
+                }
+            }
+        } else {
+            $all_in_lines .= $_;
+        }
+        $all_in_lines .= "\n";
+    }
+    close(FIN);
+
+    open FOUT, ">$fout" or die "can't open $fout to write\n";
+    print FOUT $all_in_lines;
+    close(FOUT);
+
+    $chmod_x = "chmod +x $fout";
+    system $chmod_x;
+
+}
+
+#******************************************************************************
+# main
+#******************************************************************************
+
+if (scalar(@ARGV) < 1) {
+    print STDERR "$pname: fatal: No command given to execute.\n";
+    exit (1);
+}
+
+if ($ENV{'LSF_BINDIR'} eq "") {
+    print STDERR "$pname: please source LSF configure profile.\n";
+    exit(1);
+}
+
+open_debug_file();
+
+parseOptions();
+
+if (1 == $g_help_option_slurm) {
+    showUsage();
+    exit (0);
+}
+
+if (1 == $g_usage_option_slurm) {
+    showShortUsage();
+    exit (0);
+}
+
+if ($g_open_mode_option_slurm ne "") {
+    print DBGFILE "g_open_mode_option_slurm: $g_open_mode_option_slurm\n";
+    if (lc($g_open_mode_option_slurm) eq "a") {
+        $g_out_option_lsf = "-o";
+        $g_error_option_lsf = "-e";
+    }
+}
+
+if ($g_out_option_slurm ne "") {
+    print DBGFILE "g_out_option_slurm: $g_out_option_slurm\n";
+    if ($g_out_option_slurm eq "none") {
+        $g_cli_lsf .= " $g_out_option_lsf /dev/null";
+    } else {
+        $g_cli_lsf .= " $g_out_option_lsf $g_out_option_slurm";
+    }
+}
+
+if ($g_error_option_slurm ne "") {
+    print DBGFILE "g_error_option_slurm: $g_error_option_slurm\n";
+    if ($g_error_option_slurm eq "none") {
+        $g_cli_lsf .= " $g_error_option_lsf /dev/null";
+    } else {
+        $g_cli_lsf .= " $g_error_option_lsf $g_error_option_slurm";
+    }
+}
+
+if ($g_export_option_slurm ne "") {
+    print DBGFILE "g_export_option_slurm: $g_export_option_slurm\n";
+    if (lc($g_export_option_slurm) eq "none") {
+        $g_cli_lsf .= " -env \"".lc($g_export_option_slurm)."\"";
+    } else {
+        $g_export_option_slurm =~ s/none,//; # remove none,
+        $g_cli_lsf .= " -env \"".$g_export_option_slurm."\"";
+    }
+
+}
+
+if ($g_exclusive_option_slurm ne "") {
+    print DBGFILE "g_exclusive_option_slurm: $g_exclusive_option_slurm\n";
+    if (lc($g_exclusive_option_slurm) eq "user") {
+        $g_cli_lsf .= " -x";
+    } elsif (lc($g_exclusive_option_slurm) eq "mcs") {
+        print STDERR "$pname: error: unsupported exclusive option $g_exclusive_option_slurm\n";
+        exit (1);
+    } else {
+        print STDERR "$pname: error: invalid exclusive option $g_exclusive_option_slurm, or not supported by the wrapper\n";
+        exit (1);
+    }
+}
+
+if (1 == $g_hold_option_slurm) {
+    $g_cli_lsf .= " -H";
+}
+
+if ($g_input_option_slurm ne "") {
+    print DBGFILE "g_input_option_slurm: $g_input_option_slurm\n";
+    $g_cli_lsf .= " -i ".$g_input_option_slurm;
+}
+
+if ($g_jname_option_slurm ne "") {
+    print DBGFILE "g_jname_option_slurm: $g_jname_option_slurm\n";
+    $g_cli_lsf .= " -J ".$g_jname_option_slurm;
+} else {
+    print DBGFILE "set job name to $g_executable\n";
+    $g_cli_lsf .= " -J ".$g_executable;
+}
+
+if ($g_mailuser_option_slurm ne "") {
+    print DBGFILE "g_mailuser_option_slurm: $g_mailuser_option_slurm\n";
+    $g_cli_lsf .= " -u ".$g_mailuser_option_slurm;
+}
+
+if ($g_workdir_option_slurm ne "") {
+    print DBGFILE "g_workdir_option_slurm: $g_workdir_option_slurm\n";
+    $g_cli_lsf .= " -cwd \"$g_workdir_option_slurm\"";
+}
+
+if ($g_partition_option_slurm ne "") {
+    print DBGFILE "g_partition_option_slurm: $g_partition_option_slurm\n";
+    $g_cli_lsf .= " -q ".$g_partition_option_slurm;
+}
+
+if ($g_time_option_slurm ne "") {
+    print DBGFILE "g_time_option_slurm: $g_time_option_slurm\n";
+    if ($g_time_option_slurm =~ /^?\d+$/) {
+        $g_cli_lsf .= " -W ".$g_time_option_slurm;
+    } else {
+        print STDERR "$pname: error: Invalid time limit specification\n";
+        exit (1);
+    }
+}
+
+if ($g_nodelist_option_slurm ne "") { # TODO
+    print DBGFILE "g_nodelist_option_slurm: $g_nodelist_option_slurm\n";
+    $g_cli_lsf .= " -m ".$g_nodelist_option_slurm;
+}
+
+if ($g_nodes_option_slurm ne "") {
+    print DBGFILE "g_nodes_option_slurm: $g_nodes_option_slurm\n";
+    $g_nodes_option_slurm =~ s/(.*)-.*/$1/;
+
+=pod
+    rules:
+    1. -N a --ntasks-per-node b ==> bsub -n (a*b) span[ptile=b]
+    2. -N a -n b --ntask-per-node c ==> 
+        if a < b/c: submission failed
+        else bsub -n b span[ptile=^(b/a)]
+    3. -N a -n b ==> bsub -n b span[ptile=^(b/a)]
+    4. -N a ==> bsub -n a span[ptile=1]
+=cut
+
+    if (($g_ntasks_per_node_option_slurm eq "") and ($g_ntasks_option_slurm eq "")) { # 4
+        $g_ntasks_per_node_option_slurm = 1;
+        $g_ntasks_option_slurm = $g_nodes_option_slurm;
+    } elsif ($g_ntasks_option_slurm eq "") { # 1
+        $g_ntasks_option_slurm = $g_nodes_option_slurm * $g_ntasks_per_node_option_slurm;
+    } else { # 2 & 3
+        if ($g_ntasks_per_node_option_slurm ne "") {
+            if ($g_nodes_option_slurm < $g_ntasks_option_slurm / $g_ntasks_per_node_option_slurm) {
+                print STDERR "$pname: error: Batch job submission failed: Requested node configuration is not available\n";
+                exit(1);
+            }
+        } else {
+            local $tmp_cnt = $g_ntasks_option_slurm / $g_nodes_option_slurm;
+            $g_ntasks_per_node_option_slurm = int($tmp_cnt) == $tmp_cnt ? $tmp_cnt : int($tmp_cnt) + 1;
+        }
+    }
+    $g_cli_lsf .= " -n $g_ntasks_option_slurm -R \"span[ptile=$g_ntasks_per_node_option_slurm]\"";
+} else {
+    local $is_ntasks_per_node_configured = 0;
+    # extract host mxj value
+    $hname = `hostname`;
+    chomp($hname);
+    print DBGFILE "g_host_mxj($hname): ";
+    $g_host_mxj = `bhosts $hname | grep $hname | awk '{print \$4;}'`;
+    chomp($g_host_mxj);
+    print DBGFILE "$g_host_mxj\n";
+
+    local $parallel_none_configured = 0;
+    if (($g_ntasks_option_slurm ne "") and ($g_ntasks_per_node_option_slurm ne "")) {
+        $is_ntasks_per_node_configured = 1;
+    } elsif ($g_ntasks_option_slurm ne "") {
+        $g_ntasks_per_node_option_slurm = $g_host_mxj;
+    } elsif ($g_ntasks_per_node_option_slurm ne "") {
+        $is_ntasks_per_node_configured = 1;
+        $g_ntasks_option_slurm = $g_ntasks_per_node_option_slurm;
+    } else {
+        $g_ntasks_option_slurm = 1;
+        $g_ntasks_per_node_option_slurm = 1;
+        $parallel_none_configured = 1;
+    }
+
+    print DBGFILE "g_ntasks_option_slurm: $g_ntasks_option_slurm, g_ntasks_per_node_option_slurm: $g_ntasks_per_node_option_slurm\n";
+    if ($g_ntasks_per_node_option_slurm > $g_host_mxj) {
+        print STDERR "$pname: error: CPU count per node can not be satisfied\n";
+        print STDERR "$pname: error: Batch job submission failed: Requested node configuration is not available\n";
+        exit(1);
+    }
+
+    if ($g_ntasks_per_node_option_slurm > $g_ntasks_option_slurm) {
+        $g_ntasks_per_node_option_slurm = $g_ntasks_option_slurm;
+    }
+
+    # adjust $g_ntasks_per_node_option_slurm according slurm behavior
+    local $tmp_cnt = $g_ntasks_option_slurm / $g_ntasks_per_node_option_slurm;
+    local $min_node = int($tmp_cnt) == $tmp_cnt ? $tmp_cnt : int($tmp_cnt) + 1;
+    if ($is_ntasks_per_node_configured == 1) { # not necessary adjust if not configured in cli
+        if ($min_node * $g_ntasks_per_node_option_slurm != $g_ntasks_option_slurm) {
+            $tmp_cnt = $g_ntasks_option_slurm / $min_node;
+            $g_ntasks_per_node_option_slurm = int($tmp_cnt) == $tmp_cnt ? $tmp_cnt : int($tmp_cnt) + 1;
+            print DBGFILE "adjusted g_ntasks_per_node_option_slurm: $g_ntasks_per_node_option_slurm\n";
+        }
+    }
+
+    if ($parallel_none_configured == 0) {
+        $g_cli_lsf .= " -n $g_ntasks_option_slurm -R \"span[ptile=$g_ntasks_per_node_option_slurm]\"";
+    }
+}
+
+local @seg_cli_exe_args = ();
+if ($g_executable_args ne "") { # extract slurm script file name
+    @seg_cli_exe_args = split(/[ \t\n]+/, $g_executable_args, 2);
+    $g_job_script_slurm = $seg_cli_exe_args[0];
+    print DBGFILE "g_job_script_slurm: $g_job_script_slurm\n";
+
+    # do some pre-check
+    if (!(-e $g_job_script_slurm) or !(-r $g_job_script_slurm)) { # in lsf, the script is not required begin with #!/bin/*sh .... line
+        print STDERR "$pname: error: Unable to open file $g_job_script_slurm\n";
+        exit(1);
+    }
+}
+
+$SIG{'INT'} = 'signal_handler'; 
+$SIG{'ABRT'} = 'signal_handler';
+# ...
+
+
+if (0) {
+    print DBGFILE "generate the lsf format script file ...\n";
+    local $lsf_script_dir = ""; # 1. -D; 2. slurm script file dir; 3. current dir; 4. HOME; 5. /tmp
+
+    if (($g_workdir_option_slurm ne "") and (-w $g_workdir_option_slurm)) {
+        $lsf_script_dir = $g_workdir_option_slurm;
+        $lsf_script_dir =~ s/(.*)\/$/$1/;
+    } elsif (-w dirname($g_job_script_slurm)) {
+        $lsf_script_dir = dirname(getcwd()."/$pname"); #$lsf_script_dir = dirname($g_job_script_slurm);
+    } elsif (-w $ENV{"PWD"}) {
+        $lsf_script_dir = $ENV{"PWD"};
+    } elsif (-w $ENV{"HOME"}) {
+        $lsf_script_dir = $ENV{"HOME"};
+    } else {
+        $lsf_script_dir = "/tmp";
+    }
+    print DBGFILE "lsf_script_dir: $lsf_script_dir\n";
+
+    $g_job_script_lsf = basename($g_job_script_slurm).".".time();
+    print DBGFILE "g_job_script_lsf: $g_job_script_lsf\n";
+
+    $g_job_script_lsf = $lsf_script_dir."/".$g_job_script_lsf;
+
+    job_script_convert($g_job_script_slurm, $g_job_script_lsf);
+}
+
+print DBGFILE "generate one temp file for error output by function tmpnam() ...: ";
+do { $g_cli_error_tmp_file = tmpnam() }
+    until IO::File->new($g_cli_error_tmp_file, O_RDWR|O_CREAT|O_EXCL);
+
+print DBGFILE "$g_cli_error_tmp_file.\n";
+
+
+if ($#seg_cli_exe_args == 1) {
+    $g_cli_lsf .= " \"$g_job_script_slurm $seg_cli_exe_args[1]\" 2> $g_cli_error_tmp_file";
+} else {
+    $g_cli_lsf .= " \"$g_job_script_slurm\" 2> $g_cli_error_tmp_file";
+}
+
+if ($g_nodes_option_slurm ne "") {
+    $g_cli_lsf = "export BATCH_SLURM_LSF=1; export SLURM_NNODES=$g_nodes_option_slurm; export SLURM_NTASKS=$g_ntasks_option_slurm; export SLURM_NTASKS_PER_NODE=$g_ntasks_per_node_option_slurm; $g_cli_lsf";
+} else {
+    $g_cli_lsf = "export BATCH_SLURM_LSF=1; export SLURM_NTASKS=$g_ntasks_option_slurm; export SLURM_NTASKS_PER_NODE=$g_ntasks_per_node_option_slurm; $g_cli_lsf";
+}
+
+print DBGFILE "converted lsf cli: $g_cli_lsf\n";
+
+$result = `$g_cli_lsf`;
+
+
+print DBGFILE `cat $g_cli_error_tmp_file`;
+local $err_msg_lsf = "";
+$err_msg_lsf = `cat $g_cli_error_tmp_file | grep -v "Waiting for dispatch" | grep -v "Starting on"`;
+
+if ($err_msg_lsf ne "") {
+    if ($err_msg_lsf =~ /Too many tasks requested. Job not submitted./) {
+        print STDERR "$pname: error: Unable to allocate resources: Requested node configuration is not available.\n";
+    } else {
+        print STDERR "$pname: $err_msg_lsf\n";
+    }
+} else {
+    print DBGFILE $result;
+    $result =~ /Job <(.*)> is submitted/;
+    $jobid = $1;
+    print "Submitted batch job $1\n";
+}
+
+close_debug_file();
+if (-e $g_cli_error_tmp_file) {
+    unlink($g_cli_error_tmp_file); 
+}
+
+# atexit-style handler
+END { 
+    close_debug_file();
+    if (-e $g_cli_error_tmp_file) {
+        unlink($g_cli_error_tmp_file);
+    }
+}
+

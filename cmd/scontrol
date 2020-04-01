@@ -1,0 +1,262 @@
+#!/usr/bin/perl
+#
+# Copyright International Business Machines Corp, 2018.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+#=============================================================================
+# File        : scontrol
+# Description : scontrol wrapper used in lsf cluster
+#
+# Author      : Chen Guang Zhao (zhchgbj@cn.ibm.com)
+#
+#=============================================================================
+# Declaration of required modules and/or Perl libraries
+#=============================================================================
+
+use Getopt::Std;
+use File::Basename qw<basename dirname>;
+
+use Getopt::Long;
+Getopt::Long::Configure("bundling", "no_ignore_case");
+
+use IO::Handle;
+STDOUT->autoflush(1);
+STDERR->autoflush(1);
+
+my ($debug) = 0; # 0: on/off debug depends on env SLURM_TO_LSF_DEBUG and SLURM_TO_LSF_DEBUG_SCANCEL
+my $pname = basename $0;
+
+my $g_cli_lsf = "";
+
+# supported options
+my $g_help_option_slurm = 0;
+my @g_jobid_list = ();
+
+
+#=============================================================================
+# sub routine: open_debug_file 
+# Input arguements: nothing
+# Return value: nothing
+#=============================================================================
+sub open_debug_file {
+    if ($debug == 0) {
+        if (($ENV{"SLURM_TO_LSF_DEBUG"} ne "") || ($ENV{"SLURM_TO_LSF_DEBUG_SCONTROL"} ne "")) {
+            $debug = 1;
+        }
+    }
+
+    if ($debug) { # debug messages dumps to /tmp/scancel.uid.pid
+        open DBGFILE, ">/tmp/$pname.$ENV{'USER'}.$$" or die "can't open /tmp/$pname.$ENV{'USER'}.$$ file to write\n";
+
+        print DBGFILE "execution time : ";
+        print DBGFILE scalar localtime;
+        print DBGFILE "\n";
+        print DBGFILE "pid  : ".$$."\n";
+        print DBGFILE "ruid : ".$<."\n";
+        print DBGFILE "euid : ".$>."\n";
+        print DBGFILE "user : ".$ENV{'USER'}."\n";
+        print DBGFILE "pwd  : ".$ENV{'PWD'}."\n";
+        print DBGFILE "home : ".$ENV{'HOME'}."\n";
+        print DBGFILE "host : ".$ENV{'HOST'}."\n";
+        print DBGFILE "hostn: ".$ENV{'HOSTNAME'}."\n";
+
+        print DBGFILE "LSF_BINDIR: ".$ENV{'LSF_BINDIR'}."\n";
+        print DBGFILE "argv: @ARGV\n";
+
+    }
+}
+
+#=============================================================================
+# sub routine: close_debug_file 
+# Input arguements: nothing
+# Return value: nothing
+#=============================================================================
+sub close_debug_file {
+    if ($debug) {
+        close(DBGFILE);
+    }
+}
+
+
+#=============================================================================
+# sub routine: showUsage
+# Input arguements: nothing
+# Return value: nothing
+#=============================================================================
+sub showUsage {
+    print STDOUT << "EndOfUsage";
+Usage: $pname  [<OPTION>] [<COMMAND>]
+    Valid <OPTION> values are:
+     -h or --help: equivalent to "help" command
+
+    Valid <COMMAND> values are:
+     resume <jobid_list>        resume previously suspended job (see suspend)
+     suspend <jobid_list>       susend specified job (see resume)
+     requeue <jobid_list>       re-queue a batch job
+     release <jobid_list>       permit specified job to start (see hold)
+     hold <jobid_list>          prevent specified job from starting. 
+                                <jobid_list> argument is 
+                                a comma separated list of job IDs.
+
+
+
+Help options:
+    -h or --help                show this help message
+EndOfUsage
+
+#  -s, --signal=name | integer     signal to send to job, default is SIGKILL
+
+}
+
+
+#====================================================================================
+# sub routine: parseOptions
+# Input arguements: nothing
+# Return value:  nothing
+#====================================================================================
+sub parseOptions
+{
+    local $ret = 0;
+
+    local @command_args = ();
+    local $job_status = "";
+    $ret = GetOptions(
+            'help|h' => \$g_help_option_slurm,
+            #'verbose|v' => \$g_verbose_option_slurm,
+            #'clusters|M=s' => \$g_clusters_option_slurm,
+            #'nodes|N=s' => \$ingore_value,
+            '<>' => sub { push (@command_args, @_) }
+            );
+    print DBGFILE __LINE__." ret: $ret\n";
+    if (1 != $ret) {
+        close_debug_file();
+        exit (1);
+    }
+
+
+    if (1 == $g_help_option_slurm) {
+        showUsage();
+        close_debug_file();
+        exit (0);
+    }
+
+    # COMMAND value only accept two value, "command jobid_list"
+    if (scalar(@command_args) != 2) { # executable shoulde not start with '-' char
+        print STDERR "$pname: invalid <COMMAND> or jobid_list -- '@command_args', or not supported by the wrapper\n";
+        print STDERR "Try \"$pname --help\" for more information\n";
+        exit (1);
+    }
+
+    if ($command_args[0] =~ /^ *-/) { # executable shoulde not start with '-' char
+        print STDERR "$pname: invalid option -- '$executable_args[0]', or not supported by the wrapper\n";
+        print STDERR "Try \"$pname --help\" for more information\n";
+        exit (1);
+    } elsif ($command_args[0]  eq "resume") {
+        $g_cli_lsf = "bresume";
+    } elsif ($command_args[0]  eq "suspend") {
+        $g_cli_lsf = "bstop";
+    } elsif ($command_args[0]  eq "requeue") {
+        $g_cli_lsf = "brequeue";
+    } elsif ($command_args[0]  eq "release") {
+        $g_cli_lsf = "bresume";    
+    } elsif ($command_args[0]  eq "hold") {
+        $g_cli_lsf = "bstop";    
+    } else {
+        showUsage();
+    }
+
+    @g_jobid_list= split ',', $command_args[1];
+
+    print DBGFILE "g_jobid_list: @g_jobid_list\n";
+    local $valid_jobs_num = 0;
+    for ($i = 0; $i <= $#g_jobid_list; $i++) {
+        $job_id = $g_jobid_list[$i];
+        $job_status = `bjobs $job_id 2>&1 |grep $job_id | awk '{print \$3}'`;
+        chomp($job_status);
+        #print STDERR "#######$job_id########$job_status####$command_args[0]\n";
+
+        if ($job_status eq "") {
+            next;
+        }
+        # if we want to hold a job, but the job already started, don NOT bstop the job
+        if (($job_status eq "RUN") && ($command_args[0] eq "hold")) {
+            print DBGFILE "Job $g_jobid_list[$i] is already started, cannot hold it.\n";
+            next;
+        } elsif (($job_status eq "RUN") && ($command_args[0] eq "resume")) {
+            print DBGFILE "Job $g_jobid_list[$i] is already started, cannot hold it.\n";
+            print STDERR "Access/permission denied for job $g_jobid_list[$i]\n";
+            next;
+        } elsif (($job_status eq "PEND") && ($command_args[0] eq "suspend" || $command_args[0] eq "resume")) {
+            print DBGFILE "Job $g_jobid_list[$i] is still pending for scheduling, cannot suspend it.\n";
+            print STDERR "Access/permission denied for job $g_jobid_list[$i]\n";
+            next;
+        } else {
+            $g_cli_lsf .= " ".$g_jobid_list[$i];
+            $valid_jobs_num++;
+        }
+    }
+    
+    if ($valid_jobs_num == 0) {
+        # no valid jobs to control, directly exit 
+        close_debug_file();
+        exit (0);
+    }
+    return;
+}
+
+#******************************************************************************
+# main
+#******************************************************************************
+
+if (scalar(@ARGV) < 1) {
+    print STDERR "$pname: error: No job identification provided\n";
+    exit (1);
+}
+
+if ($ENV{'LSF_BINDIR'} eq "") {
+    print STDERR "$pname: please source LSF configure profile.\n";
+    exit(1);
+}
+
+open_debug_file();
+
+parseOptions();
+
+$g_cli_lsf .= " 2>&1"; # TODO: error msg
+
+print DBGFILE "converted lsf cli: $g_cli_lsf\n";
+
+$result = `$g_cli_lsf`;
+#print "#########result:$result\n";
+print DBGFILE "$result.\n";
+my @all_output = split(/\n/, $result);
+for ($line_idx = 0; $line_idx <= $#all_output; $line_idx++) {
+    $one_line_output = $all_output[$line_idx];
+    chomp($one_line_output);
+    #print "#########oneline:$one_line_output\n";
+    ($job_id) = $one_line_output =~ /^.*<(.*)>.*$/;
+    if ($one_line_output =~ /No matching job found/) {        
+        print STDERR "Invalid job id specified for job $job_id\n";
+    } elsif ($one_line_output =~ /User permission denied/) {        
+        print STDERR "Access/permission denied for job $job_id\n";
+    } elsif ($one_line_output =~ /Job has already finished/) {        
+        print STDERR "Job/step already completing or completed for job $job_id\n";
+    } else {
+    	next;
+    }
+}
+
+
+close_debug_file();
+
