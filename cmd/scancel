@@ -1,0 +1,254 @@
+#!/usr/bin/perl
+#
+# Copyright International Business Machines Corp, 2018.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+#=============================================================================
+# File        : scancel
+# Description : scancel wrapper used in lsf cluster
+#
+# Author      : Guang Yuan Wu (wugyuan@cn.ibm.com)
+#
+#=============================================================================
+# Declaration of required modules and/or Perl libraries
+#=============================================================================
+
+use Getopt::Std;
+use File::Basename qw<basename dirname>;
+
+use Getopt::Long;
+Getopt::Long::Configure("bundling", "no_ignore_case");
+
+use IO::Handle;
+STDOUT->autoflush(1);
+STDERR->autoflush(1);
+
+my ($debug) = 0; # 0: on/off debug depends on env SLURM_TO_LSF_DEBUG and SLURM_TO_LSF_DEBUG_SCANCEL
+my $pname = basename $0;
+
+my $g_cli_lsf = "bkill";
+
+# supported options
+my $g_help_option_slurm = 0;
+my $g_usage_option_slurm = 0;
+
+my $g_jname_option_slurm = "";
+my $g_partition_option_slurm = "";
+my $g_signal_option_slurm = "";
+my $g_user_option_slurm = "";
+my $g_nodelist_option_slurm = "";
+
+my @g_jobid_list = ();
+
+
+#=============================================================================
+# sub routine: open_debug_file 
+# Input arguements: nothing
+# Return value: nothing
+#=============================================================================
+sub open_debug_file {
+    if ($debug == 0) {
+        if (($ENV{"SLURM_TO_LSF_DEBUG"} ne "") || ($ENV{"SLURM_TO_LSF_DEBUG_SCANCEL"} ne "")) {
+            $debug = 1;
+        }
+    }
+
+    if ($debug) { # debug messages dumps to /tmp/scancel.uid.pid
+        open DBGFILE, ">/tmp/$pname.$ENV{'USER'}.$$" or die "can't open /tmp/$pname.$ENV{'USER'}.$$ file to write\n";
+
+        print DBGFILE "execution time : ";
+        print DBGFILE scalar localtime;
+        print DBGFILE "\n";
+        print DBGFILE "pid  : ".$$."\n";
+        print DBGFILE "ruid : ".$<."\n";
+        print DBGFILE "euid : ".$>."\n";
+        print DBGFILE "user : ".$ENV{'USER'}."\n";
+        print DBGFILE "pwd  : ".$ENV{'PWD'}."\n";
+        print DBGFILE "home : ".$ENV{'HOME'}."\n";
+        print DBGFILE "host : ".$ENV{'HOST'}."\n";
+        print DBGFILE "hostn: ".$ENV{'HOSTNAME'}."\n";
+
+        print DBGFILE "LSF_BINDIR: ".$ENV{'LSF_BINDIR'}."\n";
+        print DBGFILE "argv: @ARGV\n";
+
+    }
+}
+
+#=============================================================================
+# sub routine: close_debug_file 
+# Input arguements: nothing
+# Return value: nothing
+#=============================================================================
+sub close_debug_file {
+    if ($debug) {
+        close(DBGFILE);
+    }
+}
+
+#=============================================================================
+# sub routine: showShortUsage
+# Input arguements: nothing
+# Return value: nothing
+#=============================================================================
+sub showShortUsage {
+    print STDOUT << "EndOfUsage";
+Usage: scancel [-n job_name] [-p partition] [--usage]
+               [-u user_name] [-w hosts...] [job_id]
+EndOfUsage
+
+# [-s signal
+
+}
+
+#=============================================================================
+# sub routine: showUsage
+# Input arguements: nothing
+# Return value: nothing
+#=============================================================================
+sub showUsage {
+    print STDOUT << "EndOfUsage";
+Usage: $pname [OPTIONS] [job_id]
+  -n, --name=job_name             act only on jobs with this name
+  -p, --partition=partition       act only on jobs in this partition
+  -u, --user=user_name            act only on jobs of this user
+  -w, --nodelist                  act only on jobs on these nodes
+
+Help options:
+  --help                          show this help message
+  --usage                         display brief usage message
+EndOfUsage
+
+#  -s, --signal=name | integer     signal to send to job, default is SIGKILL
+
+}
+
+
+#====================================================================================
+# sub routine: parseOptions
+# Input arguements: nothing
+# Return value:  nothing
+#====================================================================================
+sub parseOptions
+{
+    local $ret = 0;
+
+    $ret = GetOptions( 
+            'help|h' => \$g_help_option_slurm,
+            'usage' => \$g_usage_option_slurm,
+            'name|n=s' => \$g_jname_option_slurm,
+            'partition|p=s' => \$g_partition_option_slurm,
+            #'signal|s=s' => \$g_signal_option_slurm,
+            'user|u=s' => \$g_user_option_slurm,
+            'nodelist|w=s' => \$g_nodelist_option_slurm,
+            '<>' => sub { push (@g_jobid_list, @_) }
+            ); 
+
+    print DBGFILE __LINE__." ret: $ret\n";
+    if (1 != $ret) {
+        close_debug_file();
+        exit (1);
+    }
+    print DBGFILE "g_jobid_list: @g_jobid_list\n";
+
+    return;
+}
+
+#******************************************************************************
+# main
+#******************************************************************************
+
+if (scalar(@ARGV) < 1) {
+    print STDERR "$pname: error: No job identification provided\n";
+    exit (1);
+}
+
+if ($ENV{'LSF_BINDIR'} eq "") {
+    print STDERR "$pname: please source LSF configure profile.\n";
+    exit(1);
+}
+
+open_debug_file();
+
+parseOptions();
+
+if (1 == $g_help_option_slurm) {
+    showUsage();
+    close_debug_file();
+    exit (0);
+}
+
+if (1 == $g_usage_option_slurm) {
+    showShortUsage();
+    close_debug_file();
+    exit (0);
+}
+
+if ($g_jname_option_slurm ne "") {
+    print DBGFILE "g_jname_option_slurm: $g_jname_option_slurm\n";
+    $g_cli_lsf .= " -J ".$g_jname_option_slurm;
+}
+
+if ($g_signal_option_slurm ne "") {
+    print DBGFILE "g_signal_option_slurm: $g_signal_option_slurm\n";
+    # TODO need more process here
+    $g_cli_lsf .= " -s ".$g_signal_option_slurm;
+}
+
+if ($g_user_option_slurm ne "") {
+    print DBGFILE "g_user_option_slurm: $g_user_option_slurm\n";
+    $g_cli_lsf .= " -u ".$g_user_option_slurm;
+}
+
+if ($g_partition_option_slurm ne "") {
+    print DBGFILE "g_partition_option_slurm: $g_partition_option_slurm\n";
+    $g_cli_lsf .= " -q ".$g_partition_option_slurm;
+    
+    if ($g_user_option_slurm eq "") {
+        print DBGFILE "append -u all\n";
+        $g_cli_lsf .= " -u all";
+    }
+}
+
+if ($g_nodelist_option_slurm ne "") {
+    print DBGFILE "g_nodelist_option_slurm: $g_nodelist_option_slurm\n";
+    # only support comma-seperated list
+    $g_nodelist_option_slurm =~ s/,/ /g;
+    $g_cli_lsf .= " -m \"$g_nodelist_option_slurm\"";
+}
+
+for ($i = 0; $i <= $#g_jobid_list; $i++) {
+    $g_cli_lsf .= " ".$g_jobid_list[$i];
+}
+
+if (($#g_jobid_list < 0) and ($g_jname_option_slurm eq "")) {
+    $g_cli_lsf .= " 0";
+
+}
+
+$g_cli_lsf .= " 2>&1"; # TODO: error msg
+#no job id 638
+#> scancel -p compute -u wugyuan 638
+#scancel: error: Kill job error on job id 638: Invalid job id specified
+#>
+#> scancel 638 (no error message)
+#>
+
+print DBGFILE "converted lsf cli: $g_cli_lsf\n";
+
+$result = `$g_cli_lsf`;
+print DBGFILE "$result.\n";
+
+
+close_debug_file();
+

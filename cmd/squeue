@@ -1,0 +1,583 @@
+#!/usr/bin/perl
+#
+# Copyright International Business Machines Corp, 2018.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+#=============================================================================
+# File        : squeue
+# Description : squeue wrapper used in lsf cluster
+#
+# Author      : Guang Yuan Wu (wugyuan@cn.ibm.com)
+#
+#=============================================================================
+# Declaration of required modules and/or Perl libraries
+#=============================================================================
+
+use Getopt::Std;
+use File::Basename qw<basename dirname>;
+
+use Getopt::Long;
+Getopt::Long::Configure("bundling", "no_ignore_case");
+
+use IO::File;
+use POSIX qw(tmpnam);
+
+use IO::Handle;
+STDOUT->autoflush(1);
+STDERR->autoflush(1);
+
+my ($debug) = 0; # 0: on/off debug depends on env SLURM_TO_LSF_DEBUG and SLURM_TO_LSF_DEBUG_SQUEUE
+my $pname = basename $0;
+
+# supported options
+my $g_help_option_slurm = 0;
+my $g_usage_option_slurm = 0;
+
+my $g_jobid_option_slurm = "";
+my $g_jobname_option_slurm = "";
+my $g_partition_option_slurm = "";
+my $g_user_option_slurm = "";
+
+my (%g_queues_info);
+my (%g_jobs_info);
+#key: jobid, value: JOBID,USER,STAT,QUEUE,EXEC_HOST,JOB_NAME,RUN_TIME,RUNTIMELIMIT
+
+# bjobs -u all -o "jobid user stat queue exec_host job_name run_time runtimelimit"
+# JOBID USER STAT QUEUE EXEC_HOST JOB_NAME RUN_TIME RUNTIMELIMIT
+# 318 wugyuan RUN normal c66u01b5.pok.stglabs.ibm.com sleep 100000000000 502 second(s) -
+# 320 wugyuan RUN night c66u01b6.pok.stglabs.ibm.com sleep 1000 8 second(s) 5.0/c66u01b6.pok.stglabs.ibm.com
+# 321 wugyuan RUN night c66u01b6.pok.stglabs.ibm.com:c66u01b6.pok.stglabs.ibm.com:c66u01b5.pok.stglabs.ibm.com:c66u01b5.pok.stglabs.ibm.com ABC 0 second(s) 5.0/c66u01b6.pok.stglabs.ibm.com
+
+
+# squeue -l
+#Fri Aug 26 10:07:55 2016
+#             JOBID PARTITION     NAME     USER    STATE       TIME TIME_LIMI  NODES NODELIST(REASON)
+#               463   compute    j2.sh  wugyuan  RUNNING       0:01     10:00      2 c66u01b[5-6]
+
+
+my $g_cli_error_tmp_file = ""; # save error output from lsf command
+
+
+#=============================================================================
+# sub routine: signal_handler
+# Input arguements: nothing
+# Return value: nothing
+#=============================================================================
+sub signal_handler {
+    exit(1);
+}
+
+#=============================================================================
+# sub routine: open_debug_file 
+# Input arguements: nothing
+# Return value: nothing
+#=============================================================================
+sub open_debug_file {
+    if ($debug == 0) {
+        if (($ENV{"SLURM_TO_LSF_DEBUG"} ne "") || ($ENV{"SLURM_TO_LSF_DEBUG_SQUEUE"} ne "")) {
+            $debug = 1;
+        }
+    }
+
+    if ($debug) { # debug messages dumps to /tmp/squeue.uid.pid
+        open DBGFILE, ">/tmp/$pname.$ENV{'USER'}.$$" or die "can't open /tmp/$pname.$ENV{'USER'}.$$ file to write\n";
+
+        print DBGFILE "execution time : ";
+        print DBGFILE scalar localtime;
+        print DBGFILE "\n";
+        print DBGFILE "pid  : ".$$."\n";
+        print DBGFILE "ruid : ".$<."\n";
+        print DBGFILE "euid : ".$>."\n";
+        print DBGFILE "user : ".$ENV{'USER'}."\n";
+        print DBGFILE "pwd  : ".$ENV{'PWD'}."\n";
+        print DBGFILE "home : ".$ENV{'HOME'}."\n";
+        print DBGFILE "host : ".$ENV{'HOST'}."\n";
+        print DBGFILE "hostn: ".$ENV{'HOSTNAME'}."\n";
+
+        print DBGFILE "LSF_BINDIR: ".$ENV{'LSF_BINDIR'}."\n";
+        print DBGFILE "argv: @ARGV\n";
+
+    }
+}
+
+#=============================================================================
+# sub routine: close_debug_file 
+# Input arguements: nothing
+# Return value: nothing
+#=============================================================================
+sub close_debug_file {
+    if ($debug) {
+        close(DBGFILE);
+    }
+}
+
+#=============================================================================
+# sub routine: showShortUsage
+# Input arguements: nothing
+# Return value: nothing
+#=============================================================================
+sub showShortUsage {
+    print STDOUT << "EndOfUsage";
+Usage: $pname [--job jobid] [-n name] [-p partitions] 
+              [-u user_name] [--usage] [-l]
+EndOfUsage
+
+# [-n nodes]
+}
+
+#=============================================================================
+# sub routine: showUsage
+# Input arguements: nothing
+# Return value: nothing
+#=============================================================================
+sub showUsage {
+    print STDOUT << "EndOfUsage";
+
+Usage: squeue [OPTIONS]
+  -j, --job=job(s)                comma separated list of jobs IDs
+                                  to view, default is all
+  -l, --long                      long report
+  -n, --name=job_name(s)          comma separated list of job names to view
+  -p, --partition=partition(s)    comma separated list of partitions
+                                  to view, default is all partitions
+                                  all nodes
+  -u, --user=user_name(s)         comma separated list of users to view
+
+Help options:
+  --help                          show this help message
+  --usage                         display a brief summary of squeue options
+
+EndOfUsage
+
+}
+
+
+#====================================================================================
+# sub routine: parseOptions
+# Input arguements: nothing
+# Return value:  nothing
+#====================================================================================
+sub parseOptions
+{
+    local $ret = 0;
+
+    $ret = GetOptions( 
+            'help|h' => \$g_help_option_slurm,
+            'usage' => \$g_usage_option_slurm,
+            'long|l' => \$g_long_option_slurm,
+            'job|j=s' => \$g_jobid_option_slurm,
+            'name|n=s' => \$g_jobname_option_slurm,
+            'partition|p=s' => \$g_partition_option_slurm,
+            'user|u=s' => \$g_user_option_slurm,
+            ); 
+
+    print DBGFILE __LINE__." ret: $ret\n";
+    if (1 != $ret) {
+        close_debug_file();
+        exit (1);
+    }
+
+    return;
+}
+
+#******************************************************************************
+# main
+#******************************************************************************
+
+if ($ENV{'LSF_BINDIR'} eq "") {
+    print STDERR "$pname: please source LSF configure profile.\n";
+    exit(1);
+}
+
+open_debug_file();
+
+$SIG{'INT'} = 'signal_handler';
+$SIG{'ABRT'} = 'signal_handler';
+# ...
+
+
+parseOptions();
+
+if (1 == $g_help_option_slurm) {
+    showUsage();
+    close_debug_file();
+    exit (0);
+}
+
+if (1 == $g_usage_option_slurm) {
+    showShortUsage();
+    close_debug_file();
+    exit (0);
+}
+
+if (1 == $g_long_option_slurm) {
+    print DBGFILE "g_long_option_slurm: $g_long_option_slurm\n";
+}
+
+print DBGFILE "generate one tmp file by function tmpnam() ...: \n";
+# try new temporary filenames until we get one that didn't already exist
+do { $g_cli_error_tmp_file = tmpnam() }
+    until IO::File->new($g_cli_error_tmp_file, O_RDWR|O_CREAT|O_EXCL);
+print DBGFILE "$g_cli_error_tmp_file.\n";
+
+
+# parse jobs information from bjobs -w -u all 
+my $bjobs_out = `bjobs -u all -o "jobid user stat queue exec_host job_name run_time runtimelimit" 2> $g_cli_error_tmp_file`;
+
+my $err_msg_lsf = `cat $g_cli_error_tmp_file`;
+print DBGFILE $err_msg_lsf;
+if ($err_msg_lsf ne "") {
+    if ($g_jobid_option_slurm ne "") {
+        print DBGFILE "g_jobid_option_slurm: $g_jobid_option_slurm\n";
+
+        if ($err_msg_lsf =~ /No unfinished job found/) {
+            print STDERR "slurm_load_jobs error: Invalid job id specified\n";
+        } else {
+            print STDERR "$pname: $err_msg_lsf\n";
+        }
+        exit (1);
+    }
+}
+
+print DBGFILE "bjobs -w -u all -o ...:\n***$bjobs_out\n***\n";
+
+
+my @all_jobs = split(/\n/, $bjobs_out); 
+for ($i = 1; $i <= $#all_jobs; $i++) {
+    local $jkey = "";
+    local @one_job = ();
+    @one_job = split(/[ \t]+/, $all_jobs[$i]);
+    # convert to hash
+    for ($jidx = 0; $jidx <= $#one_job; $jidx++) {
+        $g_jobs_info{$one_job[0]} .= "$one_job[$jidx] ";
+    }
+}
+
+if ($debug) {
+    foreach $jkey (keys %g_jobs_info) {
+        print DBGFILE "$jkey: $g_jobs_info{$jkey}\n";
+    }
+}
+
+my %filter_jobs_info;
+
+
+my $override_flag = 0;
+local @in_jids = ();
+# filter by -j/--job
+if ($g_jobid_option_slurm ne "") {
+    print DBGFILE "g_jobid_option_slurm: $g_jobid_option_slurm\n";
+    @in_jids = split(/,/, $g_jobid_option_slurm);
+    for ($i = 0; $i <= $#in_jids; $i++) {
+        if (exists ($g_jobs_info{$in_jids[$i]})) {
+            print DBGFILE "filter by -j: candidate job $in_jids[$i]\n";
+            $filter_jobs_info{$in_jids[$i]} = $g_jobs_info{$in_jids[$i]};
+            $override_flag = 1;
+        }
+    }
+
+    if (0 == $override_flag) { # no any job matched
+        if ($#in_jids == 0) {
+            print STDERR "slurm_load_jobs error: Invalid job id specified\n";
+            exit(1);
+        }
+    }
+
+    %g_jobs_info = %filter_jobs_info;
+    %filter_jobs_info = ();
+    $override_flag = 0;
+}
+
+# by -n/--name
+if ($g_jobname_option_slurm ne "") {
+    print DBGFILE "g_jobname_option_slurm: $g_jobname_option_slurm\n";
+    @in_jnames = split(/,/, $g_jobname_option_slurm);
+    for ($i = 0; $i <= $#in_jnames; $i++) {
+        local $jkey = "", $jinfo = "";
+        while (($jkey, $jinfo) = each(%g_jobs_info)) {
+            @seg_jinfo = split (/ /, $jinfo);
+            $tmp_jname = "";
+            for ($j = 6; $j <= $#seg_jinfo - 3; $j++) {
+                $tmp_jname .= $seg_jinfo[$j]." ";
+            }
+            $tmp_jname = $seg_jinfo[5];
+
+            print DBGFILE "job: $seg_jinfo[0], job name: $tmp_jname\n";
+
+            if ($tmp_jname eq "$in_jnames[$i]") {
+                print DBGFILE "filter by -n: candidate job $seg_jinfo[0]\n";
+                $filter_jobs_info{$seg_jinfo[0]} = $g_jobs_info{$seg_jinfo[0]};
+                # should not 'last;', because same job name for differernt jobs
+                $override_flag = 1;
+            }
+        }
+    }
+
+    %g_jobs_info = %filter_jobs_info;
+    %filter_jobs_info = ();
+    $override_flag = 0;
+}
+
+# by -p/--partition
+if ($g_partition_option_slurm ne "") {
+    print DBGFILE "g_partition_option_slurm: $g_partition_option_slurm\n";
+    @in_partitions = split(/,/, $g_partition_option_slurm);
+    for ($i = 0; $i <= $#in_partitions; $i++) {
+        local $jkey = "", $jinfo = "";
+        while (($jkey, $jinfo) = each(%g_jobs_info)) {
+            @seg_jinfo = split (/ /, $jinfo);
+            if ($in_partitions[$i] eq $seg_jinfo[3]) {
+                print DBGFILE "filter by -p: candidate job $seg_jinfo[0]\n";
+                $filter_jobs_info{$seg_jinfo[0]} = $g_jobs_info{$seg_jinfo[0]};
+                $override_flag = 1;
+            }
+        }
+    }
+
+    %g_jobs_info = %filter_jobs_info;
+    %filter_jobs_info = ();
+    $override_flag = 0;
+}
+
+# by -u/--user
+if ($g_user_option_slurm ne "") {
+    print DBGFILE "g_user_option_slurm: $g_user_option_slurm\n";
+    @in_users = split(/,/, $g_user_option_slurm);
+    for ($i = 0; $i <= $#in_users; $i++) {
+        `id $in_users[$i] 2> $g_cli_error_tmp_file`;
+        $err_msg_lsf = `cat $g_cli_error_tmp_file`;
+        print DBGFILE $err_msg_lsf;
+        if ($err_msg_lsf ne "") {
+            if ($err_msg_lsf =~ /No such user/) {
+                print STDERR "$pname: error: Invalid user: $in_users[$i]\n\n";
+                next;
+            }
+        }
+
+        local $jkey = "", $jinfo = "";
+        while (($jkey, $jinfo) = each(%g_jobs_info)) {
+            @seg_jinfo = split (/ /, $jinfo);
+            if ($in_users[$i] eq $seg_jinfo[1]) {
+                print DBGFILE "filter by -u: candidate job $seg_jinfo[0]\n";
+                $filter_jobs_info{$seg_jinfo[0]} = $g_jobs_info{$seg_jinfo[0]};
+                $override_flag = 1;
+            }
+        }
+    }
+
+    %g_jobs_info = %filter_jobs_info;
+    %filter_jobs_info = ();
+    $override_flag = 0;
+}
+
+if ($debug) {
+    foreach $jkey (keys %g_jobs_info) {
+        print DBGFILE "final selected: $g_jobs_info{$jkey}.\n";
+    }
+}
+
+
+if (1 == $g_long_option_slurm) {
+    print `date`;
+    print "             JOBID PARTITION     NAME     USER    STATE       TIME TIME_LIMI  NODES NODELIST(REASON)\n";
+# "%.18i %.9P %.8j %.8u %.8T %.10M %.9l %.6D %R"
+
+#key: jobid, value: JOBID,USER,STAT,QUEUE,EXEC_HOST,JOB_NAME,RUN_TIME,RUNTIMELIMIT
+
+# JOBID USER STAT QUEUE EXEC_HOST JOB_NAME RUN_TIME RUNTIMELIMIT
+# 318 wugyuan RUN normal c66u01b5.pok.stglabs.ibm.com sleep 100000000000 502 second(s) -
+# 321 wugyuan RUN night c66u01b6.pok.stglabs.ibm.com:c66u01b6.pok.stglabs.ibm.com:c66u01b5.pok.stglabs.ibm.com:c66u01b5.pok.stglabs.ibm.com ABC 0 second(s) 5.0/c66u01b6.pok.stglabs.ibm.com
+
+
+    local $jkey = "", $jinfo = "";
+    while (($jkey, $jinfo) = each(%g_jobs_info)) {
+        @seg_jinfo = split (/ /, $jinfo);
+        printf ("%18d ", $seg_jinfo[0]); # JOBID
+        printf ("%9s ", $seg_jinfo[3]); # PARTITION
+        $tmp_jname = "";
+        for ($j = 5; $j <= $#seg_jinfo - 3; $j++) {
+            $tmp_jname .= $seg_jinfo[$j]." ";
+        }
+        $tmp_jname =~ s/ $//;
+        printf ("%8s ", $tmp_jname); # NAME
+        printf ("%8s ", $seg_jinfo[1]); # USER
+
+#    case JOB_PENDING:
+#        return "PENDING";
+#    case JOB_RUNNING:
+#        return "RUNNING";
+#    case JOB_SUSPENDED:
+#        return "SUSPENDED";
+#    case JOB_COMPLETE:
+#        return "COMPLETED";
+#    case JOB_CANCELLED:
+#        return "CANCELLED";
+#    case JOB_FAILED:
+#        return "FAILED";
+#    case JOB_TIMEOUT:
+#        return "TIMEOUT";
+#    case JOB_NODE_FAIL:
+#        return "NODE_FAIL";
+#    case JOB_PREEMPTED:
+#        return "PREEMPTED";
+#    case JOB_BOOT_FAIL:
+#        return "BOOT_FAIL";
+#    case JOB_DEADLINE:
+#        return "DEADLINE";
+#    default:
+#        return "?";
+
+        if ("RUN" eq $seg_jinfo[2]) { # STATE
+            printf ("%8s ", "RUNNING");
+        } elsif ("PEND" eq $seg_jinfo[2]) {
+            printf ("%8s ", "PENDING");
+        } elsif (("PSUSP" eq $seg_jinfo[2]) or ("SSUSP" eq $seg_jinfo[2]) or ("USUSP" eq $seg_jinfo[2])) {
+            printf ("%8s ", "SUSPENDED");
+        } elsif ("DONE" eq $seg_jinfo[2]) {
+            printf ("%8s ", "COMPLETED");
+        } elsif ("EXIT" eq $seg_jinfo[2]) {
+            printf ("%8s ", "FAILED");
+        } else {
+            #printf ("%8s", "?");
+            printf ("%8s ", $seg_jinfo[2]);
+        }
+        
+        printf("%10s ", "$seg_jinfo[$#seg_jinfo-2](s)"); # TIME
+        if ($seg_jinfo[$#seg_jinfo] ne "-") {
+            $seg_jinfo[$#seg_jinfo] =~ s/(.*)\/.*/$1/;
+            printf("%9s ", "$seg_jinfo[$#seg_jinfo](m)"); # TIME_LIMIT
+        } else {
+            printf("%9s ", "$seg_jinfo[$#seg_jinfo]"); # TIME_LIMIT
+        }
+
+        if ($seg_jinfo[4] ne "-") {
+            local %hostlist = (); 
+            local @seg_hlist = ();
+            @seg_hlist = split(/:/, $seg_jinfo[4]);
+            for ($hidx = 0; $hidx <= $#seg_hlist; $hidx++) {
+                $hostlist{$seg_hlist[$hidx]}++;
+            }
+            local $hlist = "";
+            local $hcount = 0;
+            foreach $hkeys (keys %hostlist) {
+                $hlist .= $hkeys.",";
+                $hcount++;
+            }
+            $hlist =~ s/,$//;
+            printf("%6d ", $hcount); # NODES
+            printf("%s", $hlist); # NODESLIST
+        } else {
+            printf("%6d ", 0); # NODES
+            printf("%s", $seg_jinfo[4]); # NODESLIST
+        }
+        print "\n";
+    }
+} else {
+    print "             JOBID PARTITION     NAME     USER ST       TIME  NODES NODELIST(REASON)\n";
+    # "%.18i %.9P %.8j %.8u %.2t %.10M %.6D %R"
+
+    local $jkey = "", $jinfo = "";
+    while (($jkey, $jinfo) = each(%g_jobs_info)) {
+        @seg_jinfo = split (/ /, $jinfo);
+        printf ("%18d ", $seg_jinfo[0]); # JOBID
+        printf ("%9s ", $seg_jinfo[3]); # PARTITION
+        $tmp_jname = "";
+        for ($j = 5; $j <= $#seg_jinfo - 3; $j++) {
+            $tmp_jname .= $seg_jinfo[$j]." ";
+        }
+        $tmp_jname =~ s/ $//;
+        printf ("%8s ", $tmp_jname); # NAME
+        printf ("%8s ", $seg_jinfo[1]); # USER
+
+
+#    case JOB_PENDING:
+#        return "PD";
+#    case JOB_RUNNING:
+#        return "R";
+#    case JOB_SUSPENDED:
+#        return "S";
+#    case JOB_COMPLETE:
+#        return "CD";
+#    case JOB_CANCELLED:
+#        return "CA";
+#    case JOB_FAILED:
+#        return "F";
+#    case JOB_TIMEOUT:
+#        return "TO";
+#    case JOB_NODE_FAIL:
+#        return "NF";
+#    case JOB_PREEMPTED:
+#        return "PR";
+#    case JOB_BOOT_FAIL:
+#        return "BF";
+#    case JOB_DEADLINE:
+#        return "DL";
+#    default:
+#        return "?";
+
+        if ("RUN" eq $seg_jinfo[2]) { # STATE
+            printf ("%2s ", "R");
+        } elsif ("PEND" eq $seg_jinfo[2]) {
+            printf ("%2s ", "PD");
+        } elsif (("PSUSP" eq $seg_jinfo[2]) or ("SSUSP" eq $seg_jinfo[2]) or ("USUSP" eq $seg_jinfo[2])) {
+            printf ("%2s ", "S");
+        } elsif ("DONE" eq $seg_jinfo[2]) {
+            printf ("%2s ", "CD");
+        } elsif ("EXIT" eq $seg_jinfo[2]) {
+            printf ("%2s ", "F");
+        } else {
+            #printf ("%8s", "?");
+            printf ("%8s ", $seg_jinfo[2]);
+        }
+        
+        printf("%10s ", "$seg_jinfo[$#seg_jinfo-2](s)"); # TIME
+
+        if ($seg_jinfo[4] ne "-") {
+            local %hostlist; 
+            local @seg_hlist = ();
+            @seg_hlist = split(/:/, $seg_jinfo[4]);
+            for ($hidx = 0; $hidx <= $#seg_hlist; $hidx++) {
+                $hostlist{$seg_hlist[$hidx]}++;
+            }
+            $hlist = "";
+            $hcount = 0;
+            foreach $hkeys (keys(%hostlist)) {
+                $hlist .= $hkeys.",";
+                $hcount++;
+            }
+            $hlist =~ s/,$//;
+            printf("%6d ", $hcount); # NODES
+                printf("%s", $hlist); # NODESLIST
+        } else {
+            printf("%6d ", 0); # NODES
+                printf("%s", $seg_jinfo[4]); # NODESLIST
+        }
+        print "\n";
+    }
+}
+
+
+close_debug_file();
+if (-e $g_cli_error_tmp_file) {
+    unlink($g_cli_error_tmp_file);
+}
+
+# atexit-style handler
+END {
+    close_debug_file();
+    if (-e $g_cli_error_tmp_file) {
+        unlink($g_cli_error_tmp_file); 
+    }
+}
+
